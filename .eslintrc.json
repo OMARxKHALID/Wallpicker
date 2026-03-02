@@ -1,0 +1,23 @@
+{
+  "env": {
+    "es2024": true
+  },
+  "parserOptions": {
+    "sourceType": "module"
+  },
+  "globals": {
+    "log": "readonly",
+    "logError": "readonly",
+    "print": "readonly",
+    "printerr": "readonly",
+    "global": "readonly"
+  },
+  "rules": {
+    "indent": ["error", 2],
+    "quotes": ["error", "double"],
+    "semi": ["error", "always"],
+    "no-unused-vars": ["warn", { "argsIgnorePattern": "^_" }],
+    "no-undef": "error",
+    "no-empty": ["error", { "allowEmptyCatch": true }]
+  }
+}

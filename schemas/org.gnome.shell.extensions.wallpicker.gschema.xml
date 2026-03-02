@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.wallpicker" path="/org/gnome/shell/extensions/wallpicker/">
+    <key name="wall-dirs" type="as">
+      <default>[]</default>
+      <summary>Wallpaper folders</summary>
+      <description>Images are pulled from all folders listed here.</description>
+    </key>
+    <key name="max-images" type="i">
+      <default>0</default>
+      <summary>Maximum images to display</summary>
+      <description>0 means show all images without limit.</description>
+    </key>
+    <key name="picture-mode" type="s">
+      <default>'zoom'</default>
+      <summary>Wallpaper display mode</summary>
+      <description>How the wallpaper fits the screen (zoom, stretched, centered, wallpaper, spanned).</description>
+    </key>
+  </schema>
+</schemalist>
