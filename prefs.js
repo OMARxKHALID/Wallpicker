@@ -57,7 +57,7 @@ const CARD_CSS = `
   }
   .wp-card.active {
     border: 2px solid @accent_bg_color;
-    background-color: alpha(@accent_bg_color, 0.15);
+    background-color: alpha(black, 0.3);
     box-shadow: 0 0 0 2px alpha(@accent_bg_color, 0.3);
   }
   flowboxchild {
@@ -69,19 +69,23 @@ const CARD_CSS = `
     transform: scale(1.02);
   }
   .wp-card .wp-name {
-    font-size: 11px;
-    font-weight: 700;
-    padding: 6px 4px 4px;
-    color: alpha(@window_fg_color, 0.8);
+    font-size: 10px;
+    font-weight: 800;
+    padding: 8px 12px;
+    color: white;
+    background-color: alpha(black, 0.3);
+    border-radius: 0 0 10px 10px;
+    margin: 0 -2px -2px -2px;
   }
   .wp-star  { font-size: 16px; color: #f5c211; padding: 4px 6px; }
   .wp-meta  {
     font-size: 10px;
     padding: 3px 8px;
     border-radius: 6px;
-    background-color: alpha(black, 0.65);
+    background-color: alpha(black, 0.3);
     color: white;
     font-weight: bold;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.8);
   }
   .wp-empty-icon  { font-size: 64px; opacity: 0.3; margin-bottom: 16px; }
   .wp-empty-title { font-size: 18px; font-weight: 800; margin-bottom: 6px; }
@@ -313,15 +317,16 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     });
 
     const controlsGroup = new Adw.PreferencesGroup();
+
     const controlsBox = new Gtk.Box({
       orientation: Gtk.Orientation.HORIZONTAL,
       spacing: 8,
+      halign: Gtk.Align.CENTER,
     });
 
     this._searchEntry = new Gtk.SearchEntry({
-      hexpand: true,
-      width_request: 480,
-      placeholder_text: "Filter wallpapers… (S/W)",
+      width_request: 300,
+      placeholder_text: "Filter wallpapers… (S)",
     });
     this._searchEntry.connect("search-changed", () => this._onSearchChanged());
     this._searchEntry.connect("activate", () => this._focusGrid());
