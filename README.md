@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/OMARxKHALID/Wallpicker/main/assets/images/icon.png" height="75" onerror="this.src='https://raw.githubusercontent.com/gnome-design-team/gnome-icons/master/Adwaita/scalable/apps/emblem-photos-symbolic.svg'">
+  <img src="assets/images/wallpapers_prefs.png" height="150">
   <h1>Wallpicker</h1>
 </div>
 
