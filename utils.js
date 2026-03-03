@@ -54,22 +54,17 @@ export const PICTURE_MODE_REVERSE = Object.fromEntries(
   Object.entries(PICTURE_MODES).map(([k, v]) => [v, k]),
 );
 
-// ---------------------------------------------------------------------------
-// Module-level state
-//
-// These are intentionally module-level so they survive across individual
-// function calls, but they must be reset when the extension is disabled to
-// avoid stale timer IDs on the next enable cycle. Call resetModule() from
-// extension.js disable().
-// ---------------------------------------------------------------------------
-
+/**
+ * Global state for debouncing writes and caching statistics.
+ */
 let _statsCache = null;
 let _saveTid = null;
 
 /**
- * Reset all module-level mutable state. Must be called from extension
- * disable() so that stale GLib timer IDs and cached data do not bleed into
- * the next enable cycle.
+ * resetModule:
+ *
+ * Resets shared state between extension enable/disable cycles.
+ * Ensures the session is clean for re-initialization.
  */
 export function resetModule() {
   if (_saveTid !== null) {
@@ -79,12 +74,12 @@ export function resetModule() {
   _statsCache = null;
 }
 
-// FIX: saveFileAsync rejections were previously silently swallowed because
-// callers never awaited or .catch()-ed the returned Promise. The function now
-// returns the Promise so callers can attach their own .catch() handler, and
-// internal errors are always logged. Note: not declared async — the function
-// manually constructs and returns a Promise, so async would be redundant and
-// misleading (though JS would auto-unwrap the inner thenable either way).
+/**
+ * saveFileAsync:
+ *
+ * Manages asynchronous file writing with directory creation.
+ * Returns a Promise for caller-level error handling.
+ */
 function saveFileAsync(path, contents) {
   try {
     GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o755);
@@ -107,14 +102,37 @@ function saveFileAsync(path, contents) {
       );
     });
   } catch (e) {
-    console.error(`[${APP_NAME}] saveFileAsync ${path}: ${e.message}`);
+    console.error(`[${APP_NAME}] saveFileAsync failed: ${e.message}`);
     throw e;
   }
 }
 
-// ---------------------------------------------------------------------------
-// Stats
-// ---------------------------------------------------------------------------
+/**
+ * recordUse:
+ *
+ * Updates the usage statistics for a wallpaper.
+ * Persists changes via debounced write.
+ */
+export function recordUse(path) {
+  try {
+    const stats = loadStats();
+    const fname = GLib.path_get_basename(path);
+    const entry = stats[fname] ?? {
+      count: 0,
+      last_used: 0.0,
+      res: null,
+      size: null,
+      mtime: 0,
+    };
+    entry.count += 1;
+    entry.last_used = GLib.get_real_time() / 1_000_000;
+    stats[fname] = entry;
+
+    _saveStats();
+  } catch (e) {
+    console.error(`[${APP_NAME}] recordUse failed: ${e.message}`);
+  }
+}
 
 function _normaliseStats(raw) {
   const out = {};
@@ -148,28 +166,30 @@ export function loadStats() {
       ? _normaliseStats(JSON.parse(new TextDecoder().decode(bytes)))
       : {};
   } catch (e) {
-    console.debug(`[${APP_NAME}] loadStats: ${e.message}`);
+    console.debug(`[${APP_NAME}] loadStats log: ${e.message}`);
     _statsCache = {};
   }
   return _statsCache;
 }
 
 function _saveStats() {
-  if (!_statsCache) return;
-  if (_saveTid) return;
+  if (!_statsCache || _saveTid) return;
 
-  // Debounce saving to 2 seconds to batch metadata updates during
-  // scrolling/hovering.
   _saveTid = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
     _saveTid = null;
     saveFileAsync(
       STATS_FILE,
       new TextEncoder().encode(JSON.stringify(_statsCache)),
-    ).catch((e) => console.error(`[${APP_NAME}] _saveStats: ${e.message}`));
+    ).catch((e) =>
+      console.error(`[${APP_NAME}] _saveStats error: ${e.message}`),
+    );
     return GLib.SOURCE_REMOVE;
   });
 }
 
+/**
+ * Synchronous write of usage statistics. Used during shutdown.
+ */
 export function flushStats() {
   if (!_saveTid || !_statsCache) return;
   GLib.Source.remove(_saveTid);
@@ -181,39 +201,9 @@ export function flushStats() {
       new TextEncoder().encode(JSON.stringify(_statsCache)),
     );
   } catch (e) {
-    console.error(`[${APP_NAME}] flushStats: ${e.message}`);
+    console.error(`[${APP_NAME}] flushStats error: ${e.message}`);
   }
 }
-
-export function recordUse(path) {
-  try {
-    const stats = loadStats();
-    const fname = GLib.path_get_basename(path);
-    // FIX: include mtime: 0 so getImageInfo's entry.mtime === mtime check
-    // never receives undefined. Without this field, getImageInfo would
-    // recompute metadata and call _saveStats() on every hover for a
-    // freshly-created entry until it was written to disk and re-read via
-    // _normaliseStats (which adds mtime: 0 for legacy entries).
-    const entry = stats[fname] ?? {
-      count: 0,
-      last_used: 0.0,
-      res: null,
-      size: null,
-      mtime: 0,
-    };
-    entry.count += 1;
-    entry.last_used = GLib.get_real_time() / 1_000_000;
-    stats[fname] = entry;
-
-    _saveStats();
-  } catch (e) {
-    console.error(`[${APP_NAME}] recordUse: ${e.message}`);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Favorites
-// ---------------------------------------------------------------------------
 
 export function loadFavorites() {
   try {
@@ -221,7 +211,7 @@ export function loadFavorites() {
     if (!ok) return new Set();
     return new Set(JSON.parse(new TextDecoder().decode(bytes)));
   } catch (e) {
-    console.debug(`[${APP_NAME}] loadFavorites: ${e.message}`);
+    console.debug(`[${APP_NAME}] loadFavorites log: ${e.message}`);
     return new Set();
   }
 }
@@ -230,12 +220,10 @@ export function saveFavorites(favSet) {
   saveFileAsync(
     FAVORITES_FILE,
     new TextEncoder().encode(JSON.stringify([...favSet])),
-  ).catch((e) => console.error(`[${APP_NAME}] saveFavorites: ${e.message}`));
+  ).catch((e) =>
+    console.error(`[${APP_NAME}] saveFavorites error: ${e.message}`),
+  );
 }
-
-// ---------------------------------------------------------------------------
-// Wallpaper (GSettings)
-// ---------------------------------------------------------------------------
 
 function _bgSettings() {
   return new Gio.Settings({ schema_id: "org.gnome.desktop.background" });
@@ -261,11 +249,15 @@ export function getCurrentWallpaper() {
     const [path] = GLib.filename_from_uri(uri);
     return path ?? "";
   } catch (e) {
-    console.debug(`[${APP_NAME}] getCurrentWallpaper: ${e.message}`);
+    console.debug(`[${APP_NAME}] getCurrentWallpaper log: ${e.message}`);
     return "";
   }
 }
 
+/**
+ * Updates GSettings with the new wallpaper URI.
+ * Handles both light and dark variants for modern GNOME compatibility.
+ */
 export function setWallpaper(path, mode = "zoom") {
   try {
     const file = Gio.File.new_for_path(path);
@@ -277,19 +269,14 @@ export function setWallpaper(path, mode = "zoom") {
     s.set_string("picture-options", mode);
     recordUse(path);
   } catch (e) {
-    console.error(`[${APP_NAME}] setWallpaper: ${e.message}`);
+    console.error(`[${APP_NAME}] setWallpaper error: ${e.message}`);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Image scanning
-//
-// Scans each directory in wallDirs recursively. Symlinks are followed but
-// already-visited real paths are skipped to prevent infinite loops.
-// The scan is intentionally limited to a single level of the filesystem
-// hierarchy per idle tick to remain non-blocking on the Shell main loop.
-// ---------------------------------------------------------------------------
-
+/**
+ * Recursive asynchronous directory scanner for images.
+ * Uses a work queue and idle callbacks to remain non-blocking.
+ */
 export function getImagesAsync(
   wallDirs,
   sortMode = "Most Used",
@@ -297,14 +284,8 @@ export function getImagesAsync(
   callback,
 ) {
   const allFiles = [];
-  // Keyed by full path so two files with the same name in different dirs
-  // are both included.
   const seen = new Set();
-  // Track real (resolved) directory paths to avoid infinite loops from
-  // symlinked subdirectories pointing back up the tree.
   const visitedDirs = new Set();
-
-  // Work queue: each entry is a directory path string to process.
   const queue = [...wallDirs];
 
   function processNextDir() {
@@ -314,20 +295,14 @@ export function getImagesAsync(
     }
 
     const dir = queue.shift();
-
-    // Resolve symlinks to detect cycles before enumeration.
-    // FIX: previously used get_symlink_target() which returns the raw symlink
-    // string and can be relative (e.g. "../../Music"), making visitedDirs keys
-    // inconsistent with the absolute paths pushed onto the queue. We now use
-    // GLib.canonicalize_filename() which resolves all symlinks, ".", and ".."
-    // segments and always returns a consistent absolute path. Available since
-    // GLib 2.58; GNOME 46+ requires GLib 2.78+ so this is always safe.
     let realDir = dir;
+
     try {
       realDir = GLib.canonicalize_filename(dir, null) ?? dir;
     } catch (_) {
       realDir = dir;
     }
+
     if (visitedDirs.has(realDir)) {
       processNextDir();
       return;
@@ -351,7 +326,7 @@ export function getImagesAsync(
           try {
             iter = source.enumerate_children_finish(res);
           } catch (e) {
-            console.debug(`[${APP_NAME}] enumerate ${dir}: ${e.message}`);
+            console.debug(`[${APP_NAME}] enumerate error: ${e.message}`);
             processNextDir();
             return;
           }
@@ -374,7 +349,6 @@ export function getImagesAsync(
                     const name = info.get_name();
                     const fileType = info.get_file_type();
 
-                    // Recurse into subdirectories.
                     if (fileType === Gio.FileType.DIRECTORY) {
                       queue.push(GLib.build_filenamev([dir, name]));
                       continue;
@@ -395,7 +369,7 @@ export function getImagesAsync(
                     return GLib.SOURCE_REMOVE;
                   });
                 } catch (e) {
-                  console.debug(`[${APP_NAME}] nextBatch ${dir}: ${e.message}`);
+                  console.debug(`[${APP_NAME}] batch error: ${e.message}`);
                   processNextDir();
                 }
               },
@@ -405,7 +379,7 @@ export function getImagesAsync(
         },
       );
     } catch (e) {
-      console.debug(`[${APP_NAME}] processNextDir ${dir}: ${e.message}`);
+      console.debug(`[${APP_NAME}] processNextDir error: ${e.message}`);
       processNextDir();
     }
   }
@@ -442,10 +416,10 @@ export function getImagesAsync(
   processNextDir();
 }
 
-// ---------------------------------------------------------------------------
-// Thumbnails
-// ---------------------------------------------------------------------------
-
+/**
+ * Generates thumbnails asynchronously.
+ * Scales images to fit THUMB_W x THUMB_H while preserving aspect ratio.
+ */
 export async function getThumbnailAsync(imagePath) {
   const hash = GLib.compute_checksum_for_string(
     GLib.ChecksumType.MD5,
@@ -478,9 +452,6 @@ export async function getThumbnailAsync(imagePath) {
     GLib.mkdir_with_parents(THUMB_CACHE_DIR, 0o755);
     GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
       try {
-        // FIX: preserve_aspect_ratio=true prevents distorting non-16:9 images
-        // (e.g. portrait wallpapers). The image is scaled to fit within the
-        // THUMB_W × THUMB_H bounding box while keeping its original ratio.
         const pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
           imagePath,
           THUMB_W,
@@ -490,9 +461,7 @@ export async function getThumbnailAsync(imagePath) {
         pixbuf.savev(thumbPath, "png", [], []);
         resolve(thumbPath);
       } catch (e) {
-        console.debug(
-          `[${APP_NAME}] getThumbnailAsync ${imagePath}: ${e.message}`,
-        );
+        console.debug(`[${APP_NAME}] getThumbnailAsync log: ${e.message}`);
         resolve(imagePath);
       }
       return GLib.SOURCE_REMOVE;
@@ -500,6 +469,10 @@ export async function getThumbnailAsync(imagePath) {
   });
 }
 
+/**
+ * Retrieves image metadata (resolution, file size).
+ * Updates and caches results in stats for subsequent performance.
+ */
 export function getImageInfo(path) {
   const fname = GLib.path_get_basename(path);
   try {
@@ -514,7 +487,6 @@ export function getImageInfo(path) {
     );
     const mtime = info.get_modification_date_time()?.to_unix() ?? 0;
 
-    // Return cached metadata if available and mtime matches.
     if (entry?.res && entry?.size && entry?.mtime === mtime)
       return `${entry.res} | ${entry.size}`;
 
@@ -529,8 +501,6 @@ export function getImageInfo(path) {
 
     const result = `${res} | ${sizeStr}`;
 
-    // Update cache only when metadata has actually changed, avoiding
-    // unnecessary _saveStats() calls on repeated hovers of the same image.
     const resChanged =
       !entry ||
       entry.res !== res ||
@@ -548,14 +518,10 @@ export function getImageInfo(path) {
 
     return result;
   } catch (e) {
-    console.debug(`[${APP_NAME}] getImageInfo ${fname}: ${e.message}`);
+    console.debug(`[${APP_NAME}] getImageInfo error: ${e.message}`);
     return "Unknown";
   }
 }
-
-// ---------------------------------------------------------------------------
-// Cache management
-// ---------------------------------------------------------------------------
 
 export function getCacheInfoAsync(callback) {
   let totalSize = 0,
@@ -607,7 +573,7 @@ export function getCacheInfoAsync(callback) {
       },
     );
   } catch (e) {
-    console.debug(`[${APP_NAME}] getCacheInfoAsync: ${e.message}`);
+    console.debug(`[${APP_NAME}] getCacheInfoAsync log: ${e.message}`);
     callback({ totalSize, count });
   }
 }
@@ -644,7 +610,6 @@ export function clearCacheAsync(callback) {
                 return;
               }
 
-              // delete_async avoids blocking the main thread per file.
               let pending = files.length;
               for (const info of files) {
                 const child = dir.get_child(info.get_name());
@@ -664,9 +629,7 @@ export function clearCacheAsync(callback) {
                 );
               }
             } catch (e) {
-              console.debug(
-                `[${APP_NAME}] clearCacheAsync batch: ${e.message}`,
-              );
+              console.debug(`[${APP_NAME}] clearCacheAsync log: ${e.message}`);
               callback?.(false);
             }
           });
@@ -675,14 +638,10 @@ export function clearCacheAsync(callback) {
       },
     );
   } catch (e) {
-    console.debug(`[${APP_NAME}] clearCacheAsync: ${e.message}`);
+    console.debug(`[${APP_NAME}] clearCacheAsync log: ${e.message}`);
     callback?.(false);
   }
 }
-
-// ---------------------------------------------------------------------------
-// Display helpers
-// ---------------------------------------------------------------------------
 
 export function makeDisplayName(fname, maxLen = 20) {
   let name = fname
@@ -700,10 +659,6 @@ export function shortenPath(path) {
   return path;
 }
 
-/**
- * A simple fuzzy match that checks if characters appear in order.
- * Returns true if match, false otherwise.
- */
 export function fuzzyMatch(query, text) {
   if (!query) return true;
   if (!text) return false;

@@ -28,6 +28,14 @@ const SMALL_ICON_SIZE = 16;
 const PREFS_FOCUS_TIMEOUT = 5000;
 const SCHEMA_ID = "org.gnome.shell.extensions.wallpicker";
 
+/**
+ * WallpickerExtension:
+ *
+ * The Shell-side component of the Wallpicker extension.
+ * This class handles the top bar menu and orchestrates the launching
+ * of the out-of-process GTK preferences window with proper focus
+ * and positioning on Wayland/X11.
+ */
 export default class WallpickerExtension extends Extension {
   _loadSettings() {
     const GioSSS = Gio.SettingsSchemaSource;
@@ -103,9 +111,11 @@ export default class WallpickerExtension extends Extension {
         continue;
       }
       const mi = new PopupMenu.PopupImageMenuItem(item.label, item.icon);
-      // set_style avoids walking PopupImageMenuItem's internal widget tree,
-      // which changes across GNOME Shell versions.
+
+      // Inline styles are used for simple properties like icon size to avoid
+      // walking internal widget trees that fluctuate across Shell versions.
       mi.set_style(`icon-size: ${SMALL_ICON_SIZE}px;`);
+
       this._signalIds.push({
         obj: mi,
         id: mi.connect("activate", item.action),
@@ -114,32 +124,18 @@ export default class WallpickerExtension extends Extension {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Open preferences
-  //
-  // CENTERING: Wayland has no API for window positioning. We temporarily set
-  // org.gnome.mutter center-new-windows so the compositor places the window
-  // in the centre of the screen, then restore the original value immediately
-  // after the window appears.
-  //
-  // FOCUS: openPreferences() spawns a subprocess. Wayland focus-stealing
-  // prevention blocks foreign processes from receiving focus. We hook
-  // global.display window-created (inside the Shell process, which holds the
-  // Wayland XDG activation token) and call win.activate() from there.
-  //
-  // _restoreCentering is stored on `this` (not a local closure) so that
-  // _cancelWatch can always call it even if _openPrefs is called twice before
-  // any window appears — a local closure would be orphaned by the second call
-  // and center-new-windows would be left permanently true.
-  //
-  // window-created is filtered to Meta.WindowType.NORMAL so transient windows
-  // from other apps don't steal the focus slot or trigger a premature restore.
-  // Note: there is an inherent race where another app opens a normal window
-  // during the PREFS_FOCUS_TIMEOUT window before the prefs window appears.
-  // The timeout fallback mitigates this but cannot fully eliminate it — this
-  // is a fundamental Wayland compositor limitation.
-  // ---------------------------------------------------------------------------
-
+  /**
+   * _openPrefs:
+   *
+   * Orchestrates the preferences window launch.
+   *
+   * Wayland Centering: Using 'org.gnome.mutter center-new-windows' ensures the
+   * compositor centers our window, as script-side positioning is restricted.
+   *
+   * Wayland Focus: Hooks 'window-created' to catch the surface and call
+   * win.activate() from inside the Shell process, bypassing focus-stealing
+   * prevention logic.
+   */
   _openPrefs() {
     this._cancelWatch();
 
@@ -156,11 +152,19 @@ export default class WallpickerExtension extends Extension {
       "window-created",
       (_d, win) => {
         if (win.get_window_type() !== Meta.WindowType.NORMAL) return;
-        this._cancelWatch();
+
+        // Verify the window belongs to our preferences process via WM_CLASS.
+        if (!win.get_wm_class()?.toLowerCase().includes("wallpicker")) return;
+
+        // Deferring ensures the surface is fully mapped and centered before
+        // focus is requested or configuration is reverted.
         GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+          this._cancelWatch();
           try {
             win.activate(global.get_current_time());
-          } catch (_) {}
+          } catch (e) {
+            console.debug(`[wallpicker] Focus activation failed: ${e.message}`);
+          }
           return GLib.SOURCE_REMOVE;
         });
       },
@@ -208,7 +212,7 @@ export default class WallpickerExtension extends Extension {
         );
       });
     } catch (e) {
-      console.error(`[wallpicker] Shuffle failed: ${e.message}`);
+      console.error(`[wallpicker] Shuffle transition failed: ${e.message}`);
     }
   }
 
@@ -218,15 +222,12 @@ export default class WallpickerExtension extends Extension {
       const dirs = settings.get_strv("wall-dirs");
       if (dirs.length === 0) dirs.push(DEFAULT_WALL_DIR);
 
-      // If no folders are configured, fall back to opening prefs so the user
-      // can add one. dirs[0] may be undefined if the user cleared all folders.
       let folderPath = dirs[0] ?? null;
 
       const curr = getCurrentWallpaper();
       if (curr) {
         const dirname = Gio.File.new_for_path(curr).get_parent()?.get_path();
         if (dirname) {
-          // Boundary check prevents /home/user/Pics matching /home/user/Pictures.
           const isUnder = dirs.some(
             (d) => dirname === d || dirname.startsWith(`${d}/`),
           );
@@ -247,7 +248,7 @@ export default class WallpickerExtension extends Extension {
 
       Gio.AppInfo.launch_default_for_uri(file.get_uri(), null);
     } catch (e) {
-      console.error(`[wallpicker] Open folder failed: ${e.message}`);
+      console.error(`[wallpicker] Folder launch failed: ${e.message}`);
     }
   }
 
@@ -258,9 +259,8 @@ export default class WallpickerExtension extends Extension {
     this._button?.destroy();
     this._button = null;
 
-    // FIX: Flush any pending stats write synchronously before the module is
-    // unloaded, and reset module-level state (_statsCache, _saveTid) so that
-    // stale GLib timer IDs do not bleed into the next enable() cycle.
+    // Statistics must be flushed synchronously to ensure data persistence
+    // during extension deactivation or shell shutdown.
     flushStats();
     resetModule();
   }

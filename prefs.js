@@ -36,6 +36,12 @@ import {
 const SCHEMA_ID = "org.gnome.shell.extensions.wallpicker";
 const SORT_MODES = ["A-Z", "Starred", "Newest", "Most Used", "Recent"];
 const DEFAULT_SORT_IDX = 3;
+
+/**
+ * The CSS provides high-performance transitions and hover effects using
+ * standard GTK4 CSS selectors. Box-shadows and transforms are offloaded
+ * to the GPU by the GSK renderer.
+ */
 const CARD_CSS = `
   .wp-card {
     border-radius: 12px;
@@ -93,12 +99,18 @@ const CARD_CSS = `
   }
 `;
 
+/**
+ * WallpickerPreferences:
+ *
+ * Implements a high-performance wallpaper gallery using GTK4.
+ * This runs in a separate process from the Shell to ensure
+ * main-thread responsiveness.
+ */
 export default class WallpickerPreferences extends ExtensionPreferences {
-  // Manually load settings from the extension's local schemas/ directory.
-  // GNOME Shell caches metadata.json at startup, so if `settings-schema` was
-  // added after the Shell process started, `this.getSettings()` will fail with
-  // "Expected type string ... got type undefined". This helper bypasses that
-  // cached metadata and always works.
+  /**
+   * Loads settings bypassing the Shell's cached metadata.
+   * This is required for robustness during developer installs.
+   */
   _loadSettings() {
     const GioSSS = Gio.SettingsSchemaSource;
     const schemaDir = this.dir.get_child("schemas");
@@ -164,12 +176,11 @@ export default class WallpickerPreferences extends ExtensionPreferences {
       return GLib.SOURCE_REMOVE;
     });
 
-    // Adw.PreferencesWindow runs its own focus init when presented, which
-    // steals focus back to the first focusable widget (_searchEntry).
-    // notify::is-active fires after Adwaita finishes, so window.set_focus()
-    // here wins. _activeSigId=null after firing is used as a sentinel in
-    // _loadNext() to call _focusGrid() if loading finishes after the window
-    // was already shown.
+    /**
+     * Handles initial focus alignment. Adw.PreferencesWindow
+     * often resets focus internally on present, so we hook
+     * 'is-active' to ensure our grid receives the focus token.
+     */
     this._activeSigId = window.connect("notify::is-active", () => {
       if (!window.is_active()) return;
       this._disconnectActiveSig();
@@ -181,7 +192,6 @@ export default class WallpickerPreferences extends ExtensionPreferences {
 
     const winKeyCtrl = new Gtk.EventControllerKey();
     winKeyCtrl.connect("key-pressed", (_c, keyval) => {
-      // Only block shortcuts if we are explicitly typing in the search bar.
       if (this._window.get_focus() === this._searchEntry) return false;
 
       if (
@@ -212,8 +222,6 @@ export default class WallpickerPreferences extends ExtensionPreferences {
 
     this._window.visible_page = nextPage;
 
-    // We explicitly focus the page, but use a small idle delay to override
-    // Adwaita's internal "auto-focus first child" logic.
     GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
       nextPage.grab_focus();
       return GLib.SOURCE_REMOVE;
@@ -235,6 +243,10 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     }
   }
 
+  /**
+   * Disables default vertical compression behaviors in Libadwaita
+   * to ensure the FlowBox grid scales naturally.
+   */
   _fixPageScroll(page) {
     function find(widget, type) {
       if (!widget) return null;
@@ -259,17 +271,10 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Move the page-navigation switcher from the header bar to the bottom of
-  // the window.
-  //
-  // Adw.PreferencesWindow already contains BOTH an Adw.ViewSwitcherTitle
-  // (inside the AdwHeaderBar, visible by default) AND an Adw.ViewSwitcherBar
-  // (at the bottom, hidden by default — it is Adwaita's own narrow-screen
-  // fallback).  We simply hide the top one and reveal the bottom one.
-  // Using the existing widget tree avoids any custom layout rewrite and keeps
-  // full compatibility with Adwaita's internal state management.
-  // ---------------------------------------------------------------------------
+  /**
+   * Translocates the navigation switcher from the header bar to
+   * a revealed ViewSwitcherBar at the bottom.
+   */
   _moveNavToBottom(window) {
     try {
       function find(widget, typeName) {
@@ -290,7 +295,7 @@ export default class WallpickerPreferences extends ExtensionPreferences {
       const bottomBar = find(window, "AdwViewSwitcherBar");
       if (bottomBar) bottomBar.set_reveal(true);
     } catch (e) {
-      console.debug(`[wallpicker] _moveNavToBottom safe-fail: ${e.message}`);
+      console.debug(`[wallpicker] _moveNavToBottom: ${e.message}`);
     }
   }
 
@@ -300,9 +305,6 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     });
     this._loadIdleId = this._searchTid = this._limitTid = null;
   }
-
-  // Wallpapers page
-  // ---------------------------------------------------------------------------
 
   _buildWallpapersPage() {
     this._wallpapersPage = new Adw.PreferencesPage({
@@ -322,7 +324,6 @@ export default class WallpickerPreferences extends ExtensionPreferences {
       placeholder_text: "Filter wallpapers… (S/W)",
     });
     this._searchEntry.connect("search-changed", () => this._onSearchChanged());
-    // Enter in search jumps focus to the grid — standard GTK4 SearchEntry UX.
     this._searchEntry.connect("activate", () => this._focusGrid());
     controlsBox.append(this._searchEntry);
 
@@ -350,14 +351,6 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     controlsGroup.add(controlsBox);
     this._wallpapersPage.add(controlsGroup);
 
-    // FlowBox is the DIRECT child of ScrolledWindow (no Gtk.Stack in between).
-    //
-    // A Stack between the Viewport and FlowBox breaks keyboard navigation:
-    // (a) set_hadjustment/set_vadjustment require adjustments in the same
-    //     coordinate space as FlowBox's children — the Stack breaks this.
-    // (b) Viewport:scroll-to-focus doesn't propagate through a Stack child.
-    //
-    // Empty states are siblings of the ScrolledWindow, toggled with set_visible.
     this._flowBox = new Gtk.FlowBox({
       valign: Gtk.Align.START,
       halign: Gtk.Align.CENTER,
@@ -372,7 +365,6 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     this._flowBox.connect("child-activated", (_fb, child) =>
       this._applyWallpaper(child),
     );
-    // Return false at navigation boundaries — lets focus leave naturally without ringing the bell.
     this._flowBox.connect("keynav-failed", () => false);
 
     const keyCtrl = new Gtk.EventControllerKey();
@@ -384,7 +376,6 @@ export default class WallpickerPreferences extends ExtensionPreferences {
       if (keyval === Gdk.KEY_w || keyval === Gdk.KEY_W) {
         if (this._activeChild) {
           this._activeChild.grab_focus();
-          this._activeChild.select_child?.(this._activeChild);
           return true;
         }
       }
@@ -486,10 +477,6 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     return box;
   }
 
-  // ---------------------------------------------------------------------------
-  // Image loading
-  // ---------------------------------------------------------------------------
-
   _loadImages(sortMode) {
     this._clearTimers();
 
@@ -530,34 +517,27 @@ export default class WallpickerPreferences extends ExtensionPreferences {
           this._emptySub.set_label("Star wallpapers to see them here");
         } else {
           this._emptyTitle.set_label("No Wallpapers Found");
-          this._emptySub.set_label(
-            `No images in: ${dirs.map(shortenPath).join(", ")}`,
-          );
+          this._emptySub.set_label(`No images in selected folders`);
         }
         this._showGridState("empty");
         return;
       }
 
       this._showGridState("grid");
-      this._gridScroll.add_css_class("hide-scrollbar"); // Start hidden
+      this._gridScroll.add_css_class("hide-scrollbar");
       this._loadIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-        // FIX: _loadNext is an async function. We fire it here and attach a
-        // .catch() so any unhandled rejection is logged rather than silently
-        // swallowed. The arrow function itself always returns GLib.SOURCE_REMOVE
-        // immediately — _loadNext re-schedules itself internally via its own
-        // GLib.idle_add calls as it works through this._pending.
         this._loadNext().catch((e) =>
-          console.error(`[wallpicker] _loadNext: ${e.message}`),
+          console.error(`[wallpicker] _loadNext error: ${e.message}`),
         );
         return GLib.SOURCE_REMOVE;
       });
     });
   }
 
-  // FIX: _loadNext is async (needed for await getThumbnailAsync) and
-  // self-schedules via GLib.idle_add. All call sites now attach .catch() so
-  // rejections are always surfaced. The function itself is unchanged in
-  // structure — only error propagation is improved.
+  /**
+   * Batches image rendering using idle callbacks to maintain
+   * 60FPS UI responsiveness during heavy loading.
+   */
   async _loadNext() {
     const batchSize = 12;
     let activeMetaToLoad = null;
@@ -610,7 +590,6 @@ export default class WallpickerPreferences extends ExtensionPreferences {
 
         const nameLabel = new Gtk.Label({ label: displayName });
         nameLabel.add_css_class("wp-name");
-        // FIX: use Pango.EllipsizeMode.END instead of magic integer 3.
         nameLabel.set_ellipsize(Pango.EllipsizeMode.END);
         cardBox.append(nameLabel);
 
@@ -618,7 +597,6 @@ export default class WallpickerPreferences extends ExtensionPreferences {
         fbChild.set_child(cardBox);
         fbChild.set_tooltip_text(displayName);
 
-        // Load image resolution/size lazily on first hover to keep bulk load fast.
         let infoLoaded = false;
         const hoverCtrl = new Gtk.EventControllerMotion();
         hoverCtrl.connect("enter", () => {
@@ -653,11 +631,10 @@ export default class WallpickerPreferences extends ExtensionPreferences {
           };
         }
       } catch (e) {
-        console.debug(`[wallpicker] _loadNext ${path}: ${e.message}`);
+        console.debug(`[wallpicker] _loadNext skip: ${e.message}`);
       }
     }
 
-    // After images are rendered, fetch metadata for the active one.
     if (activeMetaToLoad) {
       const { meta, path, fbChild, isFav, setLoaded } = activeMetaToLoad;
       const info = getImageInfo(path);
@@ -670,7 +647,7 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     if (this._pending.length > 0) {
       this._loadIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
         this._loadNext().catch((e) =>
-          console.error(`[wallpicker] _loadNext: ${e.message}`),
+          console.error(`[wallpicker] _loadNext chain error: ${e.message}`),
         );
         return GLib.SOURCE_REMOVE;
       });
@@ -690,10 +667,6 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     if (count > 12) this._gridScroll.remove_css_class("hide-scrollbar");
     else this._gridScroll.add_css_class("hide-scrollbar");
   }
-
-  // ---------------------------------------------------------------------------
-  // Actions
-  // ---------------------------------------------------------------------------
 
   _applyWallpaper(child) {
     const path = this._paths.get(child);
@@ -746,7 +719,6 @@ export default class WallpickerPreferences extends ExtensionPreferences {
   _showContextMenu(child) {
     if (this._ctxPopover) {
       this._ctxPopover.unparent();
-      this._ctxPopover = null;
     }
     const path = this._paths.get(child);
     if (!path) return;
@@ -761,11 +733,8 @@ export default class WallpickerPreferences extends ExtensionPreferences {
       margin_end: 4,
     });
 
-    for (const item of [
-      {
-        label: "Set as Wallpaper",
-        cb: () => this._applyWallpaper(child),
-      },
+    const items = [
+      { label: "Set as Wallpaper", cb: () => this._applyWallpaper(child) },
       {
         label: isFav ? "★ Remove Favorite (F)" : "☆ Add Favorite (F)",
         cb: () => this._toggleFavorite(child),
@@ -783,15 +752,14 @@ export default class WallpickerPreferences extends ExtensionPreferences {
         destructive: true,
         cb: () => this._confirmDelete(child, path),
       },
-    ]) {
+    ];
+
+    for (const item of items) {
       const btn = new Gtk.Button({
         hexpand: true,
         halign: Gtk.Align.FILL,
+        css_classes: ["flat"],
       });
-      // FIX: "flat" was being added twice (duplicate add_css_class call).
-      // Only add it once here.
-      btn.add_css_class("flat");
-
       const label = new Gtk.Label({
         label: item.label,
         xalign: 0,
@@ -831,15 +799,13 @@ export default class WallpickerPreferences extends ExtensionPreferences {
       "delete",
       Adw.ResponseAppearance.DESTRUCTIVE,
     );
-    dialog.set_default_response("cancel");
-    dialog.set_close_response("cancel");
 
     dialog.connect("response", (_d, response) => {
       if (response !== "delete") return;
       try {
         Gio.File.new_for_path(path).delete(null);
       } catch (e) {
-        console.error(`[wallpicker] Delete failed: ${e.message}`);
+        console.error(`[wallpicker] Delete error: ${e.message}`);
         return;
       }
 
@@ -860,14 +826,9 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     dialog.present(this._window);
   }
 
-  // ---------------------------------------------------------------------------
-  // Search
-  // ---------------------------------------------------------------------------
-
   _onSearchChanged() {
     if (this._searchTid) {
       GLib.Source.remove(this._searchTid);
-      this._searchTid = null;
     }
     this._searchTid = GLib.timeout_add(
       GLib.PRIORITY_DEFAULT,
@@ -876,10 +837,12 @@ export default class WallpickerPreferences extends ExtensionPreferences {
         this._searchTid = null;
         this._queryCache = this._searchEntry.get_text().toLowerCase().trim();
         this._flowBox.invalidate_filter();
+
         if (!this._queryCache) {
           this._showGridState("grid");
           return GLib.SOURCE_REMOVE;
         }
+
         let hasVisible = false;
         let c = this._flowBox.get_first_child();
         while (c) {
@@ -901,16 +864,11 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     return fuzzyMatch(this._queryCache, this._names.get(child) ?? "");
   }
 
-  // ---------------------------------------------------------------------------
-  // Folders page
-  // ---------------------------------------------------------------------------
-
   _buildFoldersPage() {
     const page = new Adw.PreferencesPage({
       title: "Folders",
       icon_name: "folder-pictures-symbolic",
     });
-
     this._foldersGroup = new Adw.PreferencesGroup({
       title: "Wallpaper Folders",
       description: "Images are pulled from all folders listed below.",
@@ -925,7 +883,10 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     this._rebuildFolderRows();
 
     const addGroup = new Adw.PreferencesGroup();
-    const addRow = new Adw.ActionRow({ title: "Add Folder…" });
+    const addRow = new Adw.ActionRow({
+      title: "Add Folder…",
+      activatable: true,
+    });
     addRow.add_prefix(
       new Gtk.Image({
         icon_name: "list-add-symbolic",
@@ -933,7 +894,6 @@ export default class WallpickerPreferences extends ExtensionPreferences {
         valign: Gtk.Align.CENTER,
       }),
     );
-    addRow.set_activatable(true);
     addRow.connect("activated", () => this._onAddFolder());
     addGroup.add(addRow);
 
@@ -953,15 +913,13 @@ export default class WallpickerPreferences extends ExtensionPreferences {
         title: short,
         subtitle: short !== dir ? dir : "",
       });
-
       const btn = new Gtk.Button({
         icon_name: "user-trash-symbolic",
         valign: Gtk.Align.CENTER,
         css_classes: ["destructive-action", "flat"],
         tooltip_text: "Remove",
       });
-      // Capture i as const idx so the closure holds the correct index even
-      // after the loop variable advances.
+
       const idx = i;
       btn.connect("clicked", () => {
         this._dirs.splice(idx, 1);
@@ -991,17 +949,13 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     });
   }
 
-  // ---------------------------------------------------------------------------
-  // Display page
-  // ---------------------------------------------------------------------------
-
   _buildDisplayPage() {
     const page = new Adw.PreferencesPage({
       title: "Display",
       icon_name: "video-display-symbolic",
     });
-
     const gridGroup = new Adw.PreferencesGroup({ title: "Preferences" });
+
     const maxRow = new Adw.SpinRow({
       title: "Max Images",
       subtitle: "0 = show all (no limit)",
@@ -1014,6 +968,7 @@ export default class WallpickerPreferences extends ExtensionPreferences {
         page_increment: 100,
       }),
     });
+
     maxRow.connect("changed", (editable) => {
       const text = editable.get_text();
       const filtered = text.replace(/[^\d]/g, "");
@@ -1022,13 +977,10 @@ export default class WallpickerPreferences extends ExtensionPreferences {
 
     maxRow.connect("notify::value", (r) => {
       this._settings.set_int("max-images", Math.round(r.get_value()));
-      if (this._limitTid) {
-        GLib.Source.remove(this._limitTid);
-        this._limitTid = null;
-      }
+      if (this._limitTid) GLib.Source.remove(this._limitTid);
       this._limitTid = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
         this._limitTid = null;
-        this._loadImages(SORT_MODES[this._sortDrop.get_selected()]);
+        this._loadImages();
         return GLib.SOURCE_REMOVE;
       });
     });
@@ -1055,19 +1007,15 @@ export default class WallpickerPreferences extends ExtensionPreferences {
 
     const shortcutsGroup = new Adw.PreferencesGroup({
       title: "Keyboard Shortcuts",
-      description: "Available when navigating the wallpaper grid",
+      description: "Available in the wallpaper grid",
     });
-
     const shortcuts = [
-      { key: "M", desc: "Cycle Menus" },
-      { key: "S", desc: "Focus Search Bar" },
-      { key: "W", desc: "Jump to Active Wallpaper" },
+      { key: "M", desc: "Cycle Navigation" },
+      { key: "S", desc: "Focus Search" },
+      { key: "W", desc: "Jump to Active" },
       { key: "F", desc: "Toggle Favorite" },
-      { key: "O", desc: "Reveal in Files" },
-      { key: "D", desc: "Delete Wallpaper" },
-      { key: "Enter", desc: "Set Wallpaper" },
-      { key: "Arrows", desc: "Navigate Grid" },
-      { key: "Q / Esc", desc: "Close Window" },
+      { key: "O", desc: "Open Folder" },
+      { key: "D", desc: "Delete File" },
     ];
 
     for (const s of shortcuts) {
@@ -1076,6 +1024,8 @@ export default class WallpickerPreferences extends ExtensionPreferences {
         label: s.key,
         css_classes: ["dim-label"],
         valign: Gtk.Align.CENTER,
+        margin_start: 8,
+        margin_end: 8,
       });
       const kbdBox = new Gtk.Box({
         css_classes: ["card"],
@@ -1083,32 +1033,23 @@ export default class WallpickerPreferences extends ExtensionPreferences {
         margin_bottom: 6,
       });
       kbdBox.append(kbd);
-      kbd.margin_start = kbd.margin_end = 8;
-      kbd.margin_top = kbd.margin_bottom = 2;
-
       row.add_suffix(kbdBox);
       shortcutsGroup.add(row);
     }
     page.add(shortcutsGroup);
-
     return page;
   }
-
-  // ---------------------------------------------------------------------------
-  // Storage page
-  // ---------------------------------------------------------------------------
 
   _buildStoragePage() {
     const page = new Adw.PreferencesPage({
       title: "Storage",
       icon_name: "drive-harddisk-symbolic",
     });
-
     const cacheGroup = new Adw.PreferencesGroup({
       title: "Thumbnail Cache",
-      description: "Clearing frees space but slows the next launch slightly.",
+      description: "Frees disk space; slows next launch.",
     });
-    this._cacheRow = new Adw.ActionRow({ title: "Calculating…" });
+    this._cacheRow = new Adw.ActionRow({ title: "Calculating statistics…" });
 
     const spinner = new Gtk.Spinner({
       visible: false,
@@ -1153,12 +1094,9 @@ export default class WallpickerPreferences extends ExtensionPreferences {
         this._cacheRow.set_title(
           `${(totalSize / 1_048_576).toFixed(1)} MB used`,
         );
-        this._cacheRow.set_subtitle(
-          `${count} cached thumbnail${count === 1 ? "" : "s"}`,
-        );
+        this._cacheRow.set_subtitle(`${count} thumbnails cached`);
       } catch (_) {
         this._cacheRow.set_title("0.0 MB used");
-        this._cacheRow.set_subtitle("0 cached thumbnails");
       }
     });
   }

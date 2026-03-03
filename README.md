@@ -1,38 +1,71 @@
-# Wallpicker
+<div align="center">
+  <img src="https://raw.githubusercontent.com/OMARxKHALID/Wallpicker/main/assets/images/icon.png" height="75" onerror="this.src='https://raw.githubusercontent.com/gnome-design-team/gnome-icons/master/Adwaita/scalable/apps/emblem-photos-symbolic.svg'">
+  <h1>Wallpicker</h1>
+</div>
 
-A lightweight and elegant GNOME Shell Extension to easily pick and manage your wallpapers right from the top bar.
+Wallpicker is a modern and high-performance GNOME extension designed for wallpaper management across Wayland and X11 sessions. It allows you to browse, manage, and change your wallpapers directly from the top bar through a beautiful and responsive Libadwaita gallery.
 
-## Features
-- **Quick Access:** Change your wallpaper instantly from an intuitive panel menu.
-- **Multiple Folders:** Add multiple source directories to pull wallpapers from.
-- **Dynamic Grid:** Beautiful, responsive UI to browse thumbnails of your images.
-- **Favorites:** Star your most-used wallpapers to keep them at the top.
-- **Shuffle:** Randomly pick a new wallpaper with one click.
-- **Keyboard Friendly:** Use hotkeys like `S` to search, `F` to favorite, `W` to jump to active, and more.
-- **Search:** Quickly fuzzy-search wallpapers by filename.
+- **High-Performance Gallery:** Browse your library via a GPU-accelerated GTK4/Libadwaita grid.
+- **Multiple Wallpaper Folders:** Add several source directories for wallpapers.
+- **Async Execution:** Asynchronous scanning and thumbnail generation to keep the Shell responsive.
+- **Favorites & Navigation:** Star your best wallpapers and use power-user shortcuts (S, F, W, O, D, etc.).
+- **Smart Shuffle:** Instinctively swap wallpapers with a single click.
+- **Intelligent Sorting:** Sort by A-Z, Favorites, Newest, Most Used, or Recently used.
 
 ## Installation
 
-### From GNOME Extensions (Recommended)
-Wait for the official release on [extensions.gnome.org](https://extensions.gnome.org/).
+#### Dependencies
 
-### Manual Installation
-1. Clone the repository into your local extensions directory:
+- `glib-compile-schemas` to install the settings schema.
+  - Arch: `glib2`
+  - Debian/Ubuntu: `libglib2.0-bin`
+  - Fedora: `glib2-devel`
+
+#### From extensions.gnome.org (Recommended)
+
+[![GNOME Extensions](assets/images/ego.png)](https://extensions.gnome.org/extension/9476/wallpicker/)
+
+#### Manual installation
+
+1. Clone the repository:
    ```bash
    git clone https://github.com/OMARxKHALID/Wallpicker.git ~/.local/share/gnome-shell/extensions/wallpicker@omarxkhalid.github.io
    ```
-2. Compile the GSChemas (Settings):
+2. Compile the schema:
    ```bash
    glib-compile-schemas ~/.local/share/gnome-shell/extensions/wallpicker@omarxkhalid.github.io/schemas/
    ```
-3. Restart GNOME Shell (Alt+F2, type `r`, and hit Enter) or log out and log back in (on Wayland).
-4. Enable the extension using the **Extensions** app or via terminal:
-   ```bash
-   gnome-extensions enable wallpicker@omarxkhalid.github.io
-   ```
+3. Log out and back in (or restart the X11 session).
 
-## Compatibility
-Supports GNOME Shell `46`, `47`, and `48`.
+## Reporting issues
 
-## License
-This extension is licensed under the [GPL-3.0-or-later](LICENSE).
+You can report issues in our [Issue Tracker](https://github.com/OMARxKHALID/Wallpicker/issues). Before submitting, please check for existing issues and provide the following:
+
+- Distribution and version (e.g., Zorin OS 18, Fedora 41)
+- GNOME Shell version
+- Extension version
+
+## Screenshot
+
+<div align="center">
+  <img src="assets/images/wallpapers_prefs.png" width="600">
+</div>
+
+## Get involved
+
+Any type of contribution is appreciated! Check out our [CONTRIBUTING.md](CONTRIBUTING.md) for technical guidelines.
+
+- **Code:** If you are interested in contributing code, please follow the "Why over What" commenting philosophy described in the project.
+- **Translating:** Feel free to open a pull request with new localization files.
+
+Don't forget to star the project if you like it! 💫
+
+## Contributors
+
+<a href="https://github.com/OMARxKHALID/Wallpicker/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=OMARxKHALID/Wallpicker" />
+</a>
+
+<br/>
+
+Made with [contrib.rocks](https://contrib.rocks)
