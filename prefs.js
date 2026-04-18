@@ -11,6 +11,10 @@ import Pango from "gi://Pango";
 import { ExtensionPreferences } from "resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js";
 
 import {
+  initUtils,
+  initModuleAsync,
+  logDebug,
+  logError,
   loadFavorites,
   saveFavorites,
   getCurrentWallpaper,
@@ -141,13 +145,15 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     );
 
     this._settings = this._loadSettings();
-    this._favorites = loadFavorites();
+    initUtils(this._settings);
+    this._isClosed = false;
+    this._favorites = new Set();
     this._window = window;
     this._paths = new Map();
     this._names = new Map();
     this._starWidgets = new Map();
     this._activeChild = null;
-    this._current = getCurrentWallpaper();
+    this._current = "";
     this._pending = [];
     this._loadIdleId = null;
     this._searchTid = null;
@@ -168,13 +174,15 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     this._pages.forEach((p) => window.add(p));
 
     window.connect("close-request", () => {
+      this._isClosed = true;
       this._clearTimers();
       this._disconnectActiveSig();
       flushStats();
       return false;
     });
 
-    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+    this._initIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+      this._initIdleId = null;
       this._fixPageScroll(this._wallpapersPage);
       this._moveNavToBottom(window);
       return GLib.SOURCE_REMOVE;
@@ -214,7 +222,15 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     });
     window.add_controller(winKeyCtrl);
 
-    this._loadImages();
+
+    initModuleAsync()
+      .then(() => {
+        if (this._isClosed) return;
+        this._favorites = loadFavorites();
+        this._current = getCurrentWallpaper();
+        this._loadImages();
+      })
+      .catch((e) => logError("Prefs init failed", e));
   }
 
   _cyclePages() {
@@ -299,15 +315,21 @@ export default class WallpickerPreferences extends ExtensionPreferences {
       const bottomBar = find(window, "AdwViewSwitcherBar");
       if (bottomBar) bottomBar.set_reveal(true);
     } catch (e) {
-      console.debug(`[wallpicker] _moveNavToBottom: ${e.message}`);
+      logDebug(`_moveNavToBottom: ${e.message}`);
     }
   }
 
   _clearTimers() {
-    [this._loadIdleId, this._searchTid, this._limitTid].forEach((id) => {
+    [
+      this._loadIdleId,
+      this._searchTid,
+      this._limitTid,
+      this._initIdleId,
+      this._sortIdleId,
+    ].forEach((id) => {
       if (id) GLib.Source.remove(id);
     });
-    this._loadIdleId = this._searchTid = this._limitTid = null;
+    this._loadIdleId = this._searchTid = this._limitTid = this._initIdleId = this._sortIdleId = null;
   }
 
   _buildWallpapersPage() {
@@ -337,7 +359,8 @@ export default class WallpickerPreferences extends ExtensionPreferences {
       selected: DEFAULT_SORT_IDX,
       width_request: 140,
     });
-    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+    this._sortIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+      this._sortIdleId = null;
       this._sortDrop.connect("notify::selected", () =>
         this._loadImages(SORT_MODES[this._sortDrop.get_selected()]),
       );
@@ -532,7 +555,7 @@ export default class WallpickerPreferences extends ExtensionPreferences {
       this._gridScroll.add_css_class("hide-scrollbar");
       this._loadIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
         this._loadNext().catch((e) =>
-          console.error(`[wallpicker] _loadNext error: ${e.message}`),
+          logError("_loadNext error", e),
         );
         return GLib.SOURCE_REMOVE;
       });
@@ -604,10 +627,10 @@ export default class WallpickerPreferences extends ExtensionPreferences {
 
         let infoLoaded = false;
         const hoverCtrl = new Gtk.EventControllerMotion();
-        hoverCtrl.connect("enter", () => {
+        hoverCtrl.connect("enter", async () => {
           if (infoLoaded) return;
           infoLoaded = true;
-          const info = getImageInfo(path);
+          const info = await getImageInfo(path);
           meta.set_label(info);
           fbChild.set_tooltip_text(isFav ? `★ ${info}` : info);
         });
@@ -636,13 +659,13 @@ export default class WallpickerPreferences extends ExtensionPreferences {
           };
         }
       } catch (e) {
-        console.debug(`[wallpicker] _loadNext skip: ${e.message}`);
+        logDebug(`_loadNext skip: ${e.message}`);
       }
     }
 
     if (activeMetaToLoad) {
       const { meta, path, fbChild, isFav, setLoaded } = activeMetaToLoad;
-      const info = getImageInfo(path);
+      const info = await getImageInfo(path);
       meta.set_label(info);
       meta.set_visible(true);
       fbChild.set_tooltip_text(isFav ? `★ ${info}` : info);
@@ -652,7 +675,7 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     if (this._pending.length > 0) {
       this._loadIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
         this._loadNext().catch((e) =>
-          console.error(`[wallpicker] _loadNext chain error: ${e.message}`),
+          logError("_loadNext chain error", e),
         );
         return GLib.SOURCE_REMOVE;
       });
@@ -676,8 +699,9 @@ export default class WallpickerPreferences extends ExtensionPreferences {
   _applyWallpaper(child) {
     const path = this._paths.get(child);
     if (!path) return;
-
-    setWallpaper(path, this._settings.get_string("picture-mode"));
+    setWallpaper(path, this._settings.get_string("picture-mode")).catch((e) =>
+      logError("apply error", e),
+    );
 
     if (this._activeChild) {
       this._activeChild.get_child()?.remove_css_class("active");
@@ -805,27 +829,39 @@ export default class WallpickerPreferences extends ExtensionPreferences {
       Adw.ResponseAppearance.DESTRUCTIVE,
     );
 
-    dialog.connect("response", (_d, response) => {
+    dialog.connect("response", async (_d, response) => {
       if (response !== "delete") return;
-      try {
-        Gio.File.new_for_path(path).delete(null);
-      } catch (e) {
-        console.error(`[wallpicker] Delete error: ${e.message}`);
-        return;
-      }
 
-      if (this._favorites.has(fname)) {
-        this._favorites.delete(fname);
-        saveFavorites(this._favorites);
+      try {
+        const file = Gio.File.new_for_path(path);
+        await new Promise((resolve, reject) => {
+          file.delete_async(GLib.PRIORITY_DEFAULT, null, (f, res) => {
+            try {
+              resolve(f.delete_finish(res));
+            } catch (e) {
+              reject(e);
+            }
+          });
+        });
+
+        if (this._favorites.has(fname)) {
+          this._favorites.delete(fname);
+          saveFavorites(this._favorites);
+        }
+        if (this._activeChild === child) {
+          this._activeChild = null;
+          this._current = "";
+        }
+
+        this._flowBox.remove(child);
+        this._paths.delete(child);
+        this._names.delete(child);
+        this._starWidgets.delete(child);
+        this._updateScrollbar();
+        if (!this._flowBox.get_first_child()) this._showGridState("empty");
+      } catch (e) {
+        logError("Delete error", e);
       }
-      if (this._activeChild === child) {
-        this._activeChild = null;
-        this._current = "";
-      }
-      this._paths.delete(child);
-      this._names.delete(child);
-      this._starWidgets.delete(child);
-      this._flowBox.remove(child);
     });
 
     dialog.present(this._window);
@@ -1009,6 +1045,25 @@ export default class WallpickerPreferences extends ExtensionPreferences {
     });
     modeGroup.add(modeRow);
     page.add(modeGroup);
+
+    const lockscreenGroup = new Adw.PreferencesGroup({
+      title: "Lock Screen",
+      description:
+        "Sync desktop wallpaper to the lock screen. Note: If you want to see the wallpaper clearly, you must disable other extensions that blur the lock screen background, such as 'Blur My Shell'.",
+    });
+
+    const syncRow = new Adw.SwitchRow({
+      title: "Sync Wallpaper",
+      subtitle: "Automatically match lock screen background to desktop",
+    });
+    this._settings.bind(
+      "sync-lockscreen",
+      syncRow,
+      "active",
+      Gio.SettingsBindFlags.DEFAULT,
+    );
+    lockscreenGroup.add(syncRow);
+    page.add(lockscreenGroup);
 
     const shortcutsGroup = new Adw.PreferencesGroup({
       title: "Keyboard Shortcuts",

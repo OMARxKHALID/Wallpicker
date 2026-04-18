@@ -16,5 +16,15 @@
       <summary>Wallpaper display mode</summary>
       <description>How the wallpaper fits the screen (zoom, stretched, centered, wallpaper, spanned).</description>
     </key>
+    <key name="sync-lockscreen" type="b">
+      <default>true</default>
+      <summary>Sync wallpaper to lock screen</summary>
+      <description>Whether to automatically sync the desktop wallpaper to the lock screen.</description>
+    </key>
+    <key name="debug-logging" type="b">
+      <default>false</default>
+      <summary>Enable debug logging</summary>
+      <description>Show detailed logs in the system journal.</description>
+    </key>
   </schema>
 </schemalist>

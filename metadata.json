@@ -4,7 +4,7 @@
   "uuid": "wallpicker@omarxkhalid.github.io",
   "gettext-domain": "wallpicker@omarxkhalid.github.io",
   "shell-version": ["46", "47", "48"],
-  "version": 1,
+  "version": 5,
   "settings-schema": "org.gnome.shell.extensions.wallpicker",
   "url": "https://github.com/OMARxKHALID/Wallpicker"
 }

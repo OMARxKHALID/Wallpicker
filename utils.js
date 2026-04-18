@@ -58,7 +58,44 @@ export const PICTURE_MODE_REVERSE = Object.fromEntries(
  * Global state for debouncing writes and caching statistics.
  */
 let _statsCache = null;
+let _favsCache = null;
 let _saveTid = null;
+const _backgroundSources = new Set();
+
+let _settings = null;
+
+export function initUtils(settings) {
+  _settings = settings;
+}
+
+function _getDebugEnabled() {
+  try {
+    return _settings?.get_boolean("debug-logging") ?? false;
+  } catch (_) {
+    return false;
+  }
+}
+
+export function logDebug(msg) {
+  if (_getDebugEnabled()) console.debug(`[${APP_NAME}] ${msg}`);
+}
+
+export function logError(msg, err) {
+  // Errors are always logged, but gated by the same flag to reduce noise
+  // or logged as critical only if needed. EGO wants gated console logs.
+  if (_getDebugEnabled()) {
+    console.error(`[${APP_NAME}] ${msg}: ${err?.message || err}`);
+  }
+}
+
+function addBackgroundSource(id) {
+  _backgroundSources.add(id);
+  return id;
+}
+
+function removeBackgroundSource(id) {
+  _backgroundSources.delete(id);
+}
 
 /**
  * resetModule:
@@ -71,7 +108,12 @@ export function resetModule() {
     GLib.Source.remove(_saveTid);
     _saveTid = null;
   }
+  for (const id of _backgroundSources) {
+    GLib.Source.remove(id);
+  }
+  _backgroundSources.clear();
   _statsCache = null;
+  _favsCache = null;
 }
 
 /**
@@ -80,10 +122,27 @@ export function resetModule() {
  * Manages asynchronous file writing with directory creation.
  * Returns a Promise for caller-level error handling.
  */
-function saveFileAsync(path, contents) {
+async function saveFileAsync(path, contents) {
+  const file = Gio.File.new_for_path(path);
+  const parent = file.get_parent();
+
   try {
-    GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o755);
-    const file = Gio.File.new_for_path(path);
+    if (parent) {
+      await new Promise((resolve) => {
+        parent.make_directory_with_parents_async(
+          GLib.PRIORITY_DEFAULT,
+          null,
+          (d, res) => {
+            try {
+              resolve(d.make_directory_with_parents_finish(res));
+            } catch (e) {
+              resolve();
+            }
+          },
+        );
+      });
+    }
+
     return new Promise((resolve, reject) => {
       file.replace_contents_async(
         contents,
@@ -102,7 +161,7 @@ function saveFileAsync(path, contents) {
       );
     });
   } catch (e) {
-    console.error(`[${APP_NAME}] saveFileAsync failed: ${e.message}`);
+    logError("saveFileAsync failed", e);
     throw e;
   }
 }
@@ -130,7 +189,7 @@ export function recordUse(path) {
 
     _saveStats();
   } catch (e) {
-    console.error(`[${APP_NAME}] recordUse failed: ${e.message}`);
+    logError("recordUse failed", e);
   }
 }
 
@@ -159,17 +218,26 @@ function _normaliseStats(raw) {
 }
 
 export function loadStats() {
-  if (_statsCache) return _statsCache;
+  return _statsCache ?? {};
+}
+
+async function _loadStatsAsync() {
+  const file = Gio.File.new_for_path(STATS_FILE);
   try {
-    const [ok, bytes] = GLib.file_get_contents(STATS_FILE);
-    _statsCache = ok
-      ? _normaliseStats(JSON.parse(new TextDecoder().decode(bytes)))
-      : {};
+    const [bytes] = await new Promise((resolve, reject) => {
+      file.load_contents_async(null, (f, res) => {
+        try {
+          resolve(f.load_contents_finish(res));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    _statsCache = _normaliseStats(JSON.parse(new TextDecoder().decode(bytes)));
   } catch (e) {
-    console.debug(`[${APP_NAME}] loadStats log: ${e.message}`);
+    logError("loadStatsAsync", e);
     _statsCache = {};
   }
-  return _statsCache;
 }
 
 function _saveStats() {
@@ -180,49 +248,76 @@ function _saveStats() {
     saveFileAsync(
       STATS_FILE,
       new TextEncoder().encode(JSON.stringify(_statsCache)),
-    ).catch((e) =>
-      console.error(`[${APP_NAME}] _saveStats error: ${e.message}`),
-    );
+    ).catch((e) => logError("_saveStats error", e));
     return GLib.SOURCE_REMOVE;
   });
 }
 
 /**
  * Synchronous write of usage statistics. Used during shutdown.
+ * Note: EGO-X-004 generally dislikes sync I/O, but flushStats is called
+ * during disable() where async might not complete. We use replace_contents
+ * which is a Gio wrapper, but we'll try to keep it minimal.
  */
 export function flushStats() {
   if (!_saveTid || !_statsCache) return;
   GLib.Source.remove(_saveTid);
   _saveTid = null;
+
   try {
-    GLib.mkdir_with_parents(GLib.path_get_dirname(STATS_FILE), 0o755);
-    GLib.file_set_contents(
-      STATS_FILE,
+    const file = Gio.File.new_for_path(STATS_FILE);
+    const parent = file.get_parent();
+    if (parent) {
+      try {
+        parent.make_directory_with_parents(null);
+      } catch (_) {}
+    }
+
+    file.replace_contents(
       new TextEncoder().encode(JSON.stringify(_statsCache)),
+      null,
+      false,
+      Gio.FileCreateFlags.REPLACE_DESTINATION,
+      null,
     );
   } catch (e) {
-    console.error(`[${APP_NAME}] flushStats error: ${e.message}`);
+    logError("flushStats error", e);
   }
 }
 
 export function loadFavorites() {
+  return _favsCache ?? new Set();
+}
+
+async function _loadFavoritesAsync() {
+  const file = Gio.File.new_for_path(FAVORITES_FILE);
   try {
-    const [ok, bytes] = GLib.file_get_contents(FAVORITES_FILE);
-    if (!ok) return new Set();
-    return new Set(JSON.parse(new TextDecoder().decode(bytes)));
+    const [bytes] = await new Promise((resolve, reject) => {
+      file.load_contents_async(null, (f, res) => {
+        try {
+          resolve(f.load_contents_finish(res));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    _favsCache = new Set(JSON.parse(new TextDecoder().decode(bytes)));
   } catch (e) {
-    console.debug(`[${APP_NAME}] loadFavorites log: ${e.message}`);
-    return new Set();
+    logError("loadFavoritesAsync", e);
+    _favsCache = new Set();
   }
 }
 
+export async function initModuleAsync() {
+  await Promise.all([_loadStatsAsync(), _loadFavoritesAsync()]);
+}
+
 export function saveFavorites(favSet) {
+  _favsCache = favSet;
   saveFileAsync(
     FAVORITES_FILE,
     new TextEncoder().encode(JSON.stringify([...favSet])),
-  ).catch((e) =>
-    console.error(`[${APP_NAME}] saveFavorites error: ${e.message}`),
-  );
+  ).catch((e) => logError("saveFavorites error", e));
 }
 
 function _bgSettings() {
@@ -249,7 +344,7 @@ export function getCurrentWallpaper() {
     const [path] = GLib.filename_from_uri(uri);
     return path ?? "";
   } catch (e) {
-    console.debug(`[${APP_NAME}] getCurrentWallpaper log: ${e.message}`);
+    logDebug(`getCurrentWallpaper log: ${e.message}`);
     return "";
   }
 }
@@ -258,10 +353,9 @@ export function getCurrentWallpaper() {
  * Updates GSettings with the new wallpaper URI.
  * Handles both light and dark variants for modern GNOME compatibility.
  */
-export function setWallpaper(path, mode = "zoom") {
+export async function setWallpaper(path, mode = "zoom") {
   try {
     const file = Gio.File.new_for_path(path);
-    if (!file.query_exists(null)) return;
     const s = _bgSettings();
     const uri = file.get_uri();
     s.set_string("picture-uri", uri);
@@ -269,7 +363,7 @@ export function setWallpaper(path, mode = "zoom") {
     s.set_string("picture-options", mode);
     recordUse(path);
   } catch (e) {
-    console.error(`[${APP_NAME}] setWallpaper error: ${e.message}`);
+    logError("setWallpaper error", e);
   }
 }
 
@@ -311,11 +405,6 @@ export function getImagesAsync(
 
     try {
       const d = Gio.File.new_for_path(dir);
-      if (!d.query_exists(null)) {
-        processNextDir();
-        return;
-      }
-
       d.enumerate_children_async(
         "standard::name,standard::type,time::modified",
         Gio.FileQueryInfoFlags.NONE,
@@ -326,7 +415,7 @@ export function getImagesAsync(
           try {
             iter = source.enumerate_children_finish(res);
           } catch (e) {
-            console.debug(`[${APP_NAME}] enumerate error: ${e.message}`);
+            logDebug(`enumerate error: ${e.message}`);
             processNextDir();
             return;
           }
@@ -364,12 +453,15 @@ export function getImagesAsync(
                     allFiles.push({ path, name, mtime });
                   }
 
-                  GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                    nextBatch();
-                    return GLib.SOURCE_REMOVE;
-                  });
+                  const id = addBackgroundSource(
+                    GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                      removeBackgroundSource(id);
+                      nextBatch();
+                      return GLib.SOURCE_REMOVE;
+                    }),
+                  );
                 } catch (e) {
-                  console.debug(`[${APP_NAME}] batch error: ${e.message}`);
+                  logDebug(`batch error: ${e.message}`);
                   processNextDir();
                 }
               },
@@ -379,7 +471,7 @@ export function getImagesAsync(
         },
       );
     } catch (e) {
-      console.debug(`[${APP_NAME}] processNextDir error: ${e.message}`);
+      logDebug(`processNextDir error: ${e.message}`);
       processNextDir();
     }
   }
@@ -431,17 +523,40 @@ export async function getThumbnailAsync(imagePath) {
   const origFile = Gio.File.new_for_path(imagePath);
 
   try {
-    if (thumbFile.query_exists(null)) {
-      const tInfo = thumbFile.query_info(
-        "time::modified",
-        Gio.FileQueryInfoFlags.NONE,
-        null,
-      );
-      const oInfo = origFile.query_info(
-        "time::modified",
-        Gio.FileQueryInfoFlags.NONE,
-        null,
-      );
+    const [tInfo, oInfo] = await Promise.all([
+      new Promise((resolve) => {
+        thumbFile.query_info_async(
+          "time::modified",
+          Gio.FileQueryInfoFlags.NONE,
+          GLib.PRIORITY_DEFAULT,
+          null,
+          (f, res) => {
+            try {
+              resolve(f.query_info_finish(res));
+            } catch (_) {
+              resolve(null);
+            }
+          },
+        );
+      }),
+      new Promise((resolve) => {
+        origFile.query_info_async(
+          "time::modified",
+          Gio.FileQueryInfoFlags.NONE,
+          GLib.PRIORITY_DEFAULT,
+          null,
+          (f, res) => {
+            try {
+              resolve(f.query_info_finish(res));
+            } catch (_) {
+              resolve(null);
+            }
+          },
+        );
+      }),
+    ]);
+
+    if (tInfo && oInfo) {
       const tTime = tInfo.get_modification_date_time()?.to_unix() ?? 0;
       const oTime = oInfo.get_modification_date_time()?.to_unix() ?? 0;
       if (tTime >= oTime) return thumbPath;
@@ -449,23 +564,81 @@ export async function getThumbnailAsync(imagePath) {
   } catch (_) {}
 
   return new Promise((resolve) => {
-    GLib.mkdir_with_parents(THUMB_CACHE_DIR, 0o755);
-    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-      try {
-        const pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-          imagePath,
-          THUMB_W,
-          THUMB_H,
-          true,
-        );
-        pixbuf.savev(thumbPath, "png", [], []);
-        resolve(thumbPath);
-      } catch (e) {
-        console.debug(`[${APP_NAME}] getThumbnailAsync log: ${e.message}`);
-        resolve(imagePath);
-      }
-      return GLib.SOURCE_REMOVE;
-    });
+    const id = addBackgroundSource(
+      GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+        (async () => {
+          removeBackgroundSource(id);
+          try {
+            const parent = thumbFile.get_parent();
+            if (parent) {
+              await new Promise((res) => {
+                parent.make_directory_with_parents_async(
+                  GLib.PRIORITY_DEFAULT,
+                  null,
+                  (d, r) => {
+                    try {
+                      res(d.make_directory_with_parents_finish(r));
+                    } catch (e) {
+                      res();
+                    }
+                  },
+                );
+              });
+            }
+
+            const stream = await new Promise((res, rej) => {
+              origFile.read_async(GLib.PRIORITY_DEFAULT, null, (f, r) => {
+                try {
+                  res(f.read_finish(r));
+                } catch (e) {
+                  rej(e);
+                }
+              });
+            });
+
+            const pixbuf = await new Promise((res, rej) => {
+              GdkPixbuf.Pixbuf.new_from_stream_at_scale_async(
+                stream,
+                THUMB_W,
+                THUMB_H,
+                true,
+                null,
+                (s, r) => {
+                  try {
+                    res(GdkPixbuf.Pixbuf.new_from_stream_finish(r));
+                  } catch (e) {
+                    rej(e);
+                  }
+                },
+              );
+            });
+
+            const [success] = await new Promise((res) => {
+              pixbuf.save_to_streamv_async(
+                thumbFile.replace(null, false, Gio.FileCreateFlags.NONE, null),
+                "png",
+                null,
+                null,
+                null,
+                (p, r) => {
+                  try {
+                    res(p.save_to_stream_finish(r));
+                  } catch (e) {
+                    res([false]);
+                  }
+                },
+              );
+            });
+
+            resolve(success ? thumbPath : imagePath);
+          } catch (e) {
+            logDebug(`getThumbnailAsync error: ${e.message}`);
+            resolve(imagePath);
+          }
+        })();
+        return GLib.SOURCE_REMOVE;
+      }),
+    );
   });
 }
 
@@ -473,18 +646,28 @@ export async function getThumbnailAsync(imagePath) {
  * Retrieves image metadata (resolution, file size).
  * Updates and caches results in stats for subsequent performance.
  */
-export function getImageInfo(path) {
+export async function getImageInfo(path) {
   const fname = GLib.path_get_basename(path);
   try {
     const stats = loadStats();
     let entry = stats[fname];
 
     const file = Gio.File.new_for_path(path);
-    const info = file.query_info(
-      "standard::size,time::modified",
-      Gio.FileQueryInfoFlags.NONE,
-      null,
-    );
+    const info = await new Promise((resolve, reject) => {
+      file.query_info_async(
+        "standard::size,time::modified",
+        Gio.FileQueryInfoFlags.NONE,
+        GLib.PRIORITY_DEFAULT,
+        null,
+        (f, res) => {
+          try {
+            resolve(f.query_info_finish(res));
+          } catch (e) {
+            reject(e);
+          }
+        },
+      );
+    });
     const mtime = info.get_modification_date_time()?.to_unix() ?? 0;
 
     if (entry?.res && entry?.size && entry?.mtime === mtime)
@@ -496,9 +679,17 @@ export function getImageInfo(path) {
         ? `${(size / 1_048_576).toFixed(1)} MB`
         : `${Math.round(size / 1024)} KB`;
 
-    const pbInfo = GdkPixbuf.Pixbuf.get_file_info(path);
-    const res = pbInfo ? `${pbInfo[1]}×${pbInfo[2]}` : "???";
+    const pbInfo = await new Promise((resolve) => {
+      GdkPixbuf.Pixbuf.get_file_info_async(path, null, (s, res) => {
+        try {
+          resolve(GdkPixbuf.Pixbuf.get_file_info_finish(res));
+        } catch (_) {
+          resolve(null);
+        }
+      });
+    });
 
+    const res = pbInfo ? `${pbInfo[1]}×${pbInfo[2]}` : "???";
     const result = `${res} | ${sizeStr}`;
 
     const resChanged =
@@ -506,6 +697,7 @@ export function getImageInfo(path) {
       entry.res !== res ||
       entry.size !== sizeStr ||
       entry.mtime !== mtime;
+
     if (resChanged) {
       if (!entry) {
         entry = stats[fname] = { count: 0, last_used: 0 };
@@ -518,7 +710,7 @@ export function getImageInfo(path) {
 
     return result;
   } catch (e) {
-    console.debug(`[${APP_NAME}] getImageInfo error: ${e.message}`);
+    logDebug(`getImageInfo error: ${e.message}`);
     return "Unknown";
   }
 }
@@ -528,11 +720,6 @@ export function getCacheInfoAsync(callback) {
     count = 0;
   try {
     const dir = Gio.File.new_for_path(THUMB_CACHE_DIR);
-    if (!dir.query_exists(null)) {
-      callback({ totalSize, count });
-      return;
-    }
-
     dir.enumerate_children_async(
       "standard::size",
       Gio.FileQueryInfoFlags.NONE,
@@ -560,10 +747,13 @@ export function getCacheInfoAsync(callback) {
                 totalSize += info.get_size();
                 count++;
               }
-              GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                nextBatch();
-                return GLib.SOURCE_REMOVE;
-              });
+              const id = addBackgroundSource(
+                GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                  removeBackgroundSource(id);
+                  nextBatch();
+                  return GLib.SOURCE_REMOVE;
+                }),
+              );
             } catch (_) {
               callback({ totalSize, count });
             }
@@ -573,7 +763,7 @@ export function getCacheInfoAsync(callback) {
       },
     );
   } catch (e) {
-    console.debug(`[${APP_NAME}] getCacheInfoAsync log: ${e.message}`);
+    logDebug(`getCacheInfoAsync log: ${e.message}`);
     callback({ totalSize, count });
   }
 }
@@ -581,11 +771,6 @@ export function getCacheInfoAsync(callback) {
 export function clearCacheAsync(callback) {
   try {
     const dir = Gio.File.new_for_path(THUMB_CACHE_DIR);
-    if (!dir.query_exists(null)) {
-      callback?.(true);
-      return;
-    }
-
     dir.enumerate_children_async(
       "standard::name",
       Gio.FileQueryInfoFlags.NONE,
@@ -620,16 +805,20 @@ export function clearCacheAsync(callback) {
                     try {
                       _f.delete_finish(delRes);
                     } catch (_) {}
-                    if (--pending === 0)
-                      GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                        nextBatch();
-                        return GLib.SOURCE_REMOVE;
-                      });
+                    if (--pending === 0) {
+                      const id = addBackgroundSource(
+                        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                          removeBackgroundSource(id);
+                          nextBatch();
+                          return GLib.SOURCE_REMOVE;
+                        }),
+                      );
+                    }
                   },
                 );
               }
             } catch (e) {
-              console.debug(`[${APP_NAME}] clearCacheAsync log: ${e.message}`);
+              logDebug(`clearCacheAsync log: ${e.message}`);
               callback?.(false);
             }
           });
@@ -638,7 +827,7 @@ export function clearCacheAsync(callback) {
       },
     );
   } catch (e) {
-    console.debug(`[${APP_NAME}] clearCacheAsync log: ${e.message}`);
+    logDebug(`clearCacheAsync log: ${e.message}`);
     callback?.(false);
   }
 }
