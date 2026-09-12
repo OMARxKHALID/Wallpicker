@@ -19,6 +19,7 @@ import {
   getImagesAsync,
   setWallpaper,
   getCurrentWallpaper,
+  panelLuminanceAsync,
   flushStats,
   resetModule,
   initModuleAsync,
@@ -31,7 +32,11 @@ import {
 const APP_ICON = "emblem-photos-symbolic";
 const SMALL_ICON_SIZE = 16;
 const PREFS_FOCUS_TIMEOUT = 5000;
-const SCHEMA_ID = "org.gnome.shell.extensions.wallpicker";
+const PANEL_LIGHT_TEXT = "wallpicker-panel-light";
+const PANEL_DARK_TEXT = "wallpicker-panel-dark";
+// Above this average luminance the wallpaper behind the top bar is bright
+// enough that dark text reads better.
+const PANEL_LUMINANCE_PIVOT = 0.5;
 
 /**
  * WallpickerExtension:
@@ -41,30 +46,6 @@ const SCHEMA_ID = "org.gnome.shell.extensions.wallpicker";
  * preferences window lifecycle.
  */
 export default class WallpickerExtension extends Extension {
-  /**
-   * _loadSettings:
-   *
-   * Manually loads the GSettings schema from the extension's local directory.
-   * This ensures the extension can access its own keys even before it's
-   * globally installed in system paths.
-   */
-  _loadSettings() {
-    const GioSSS = Gio.SettingsSchemaSource;
-    const schemaDir = this.dir.get_child("schemas");
-    const schemaSource = GioSSS.new_from_directory(
-      schemaDir.get_path(),
-      GioSSS.get_default(),
-      false,
-    );
-    const schemaObj = schemaSource.lookup(SCHEMA_ID, true);
-    if (!schemaObj) {
-      throw new Error(
-        `Schema ${SCHEMA_ID} not found in ${schemaDir.get_path()}`,
-      );
-    }
-    return new Gio.Settings({ settings_schema: schemaObj });
-  }
-
   enable() {
     if (this._button) return;
 
@@ -75,15 +56,26 @@ export default class WallpickerExtension extends Extension {
     this._paintOverlayIdleId = null;
     this._restoreCentering = null;
 
-    this._extSettings = this._loadSettings();
+    // getSettings() resolves the schema from the settings-schema key in
+    // metadata.json, including for an uninstalled development copy.
+    this._extSettings = this.getSettings();
+    this._bgSettings = new Gio.Settings({
+      schema_id: "org.gnome.desktop.background",
+    });
+    this._ifaceSettings = new Gio.Settings({
+      schema_id: "org.gnome.desktop.interface",
+    });
     initUtils(this._extSettings);
 
     initModuleAsync().catch((e) => logError("Module init failed", e));
 
     this._button = new PanelMenu.Button(0.5, _("Wallpicker"), false);
 
-    // Initialize the lock screen background synchronization system.
+    // GNOME reapplies its own blur to the unlock dialog on every screen
+    // wake, so the sync has to patch UnlockDialog rather than just set a
+    // background once.
     this._setupLockScreenSync();
+    this._setupPanelTint();
 
     const box = new St.BoxLayout({
       style_class: "panel-status-menu-box",
@@ -108,14 +100,22 @@ export default class WallpickerExtension extends Extension {
   }
 
   disable() {
+    // This extension declares the unlock-dialog session mode because the lock
+    // screen background sync has to keep running while the screen is locked.
+    // Without it the Shell disables the extension on lock, which reverts the
+    // patched UnlockDialog method and the synced wallpaper never appears.
+    // No keyboard signals are connected in this process.
+
     // Teardown the lock screen sync to restore original system behavior.
     this._teardownLockScreenSync();
 
-    if (this._syncSignalId) {
-      this._extSettings?.disconnect(this._syncSignalId);
+    if (this._syncSignalId && this._extSettings) {
+      this._extSettings.disconnect(this._syncSignalId);
       this._syncSignalId = null;
     }
     this._extSettings = null;
+    this._bgSettings = null;
+    this._ifaceSettings = null;
 
     this._cancelWatch();
     for (const { obj, id } of this._signalIds ?? []) {
@@ -125,7 +125,10 @@ export default class WallpickerExtension extends Extension {
     this._button?.destroy();
     this._button = null;
 
-    // Flush telemetry and clear cached state to ensure clean re-initialization.
+    this._clearPanelTint();
+
+    // Flush local usage stats and clear cached state to ensure clean
+    // re-initialization.
     flushStats();
     resetModule();
   }
@@ -140,11 +143,7 @@ export default class WallpickerExtension extends Extension {
       {
         label: _("Shuffle Wallpaper"),
         icon: "media-playlist-shuffle-symbolic",
-        action: () => {
-          this._shuffleWallpaper().catch((e) =>
-            logError("Shuffle failed", e),
-          );
-        },
+        action: () => this._shuffleWallpaper(),
       },
       { separator: true },
       {
@@ -249,7 +248,7 @@ export default class WallpickerExtension extends Extension {
 
   _shuffleWallpaper() {
     try {
-      const settings = this._loadSettings();
+      const settings = this._extSettings;
       const dirs = settings.get_strv("wall-dirs");
       if (dirs.length === 0) dirs.push(DEFAULT_WALL_DIR);
 
@@ -258,6 +257,10 @@ export default class WallpickerExtension extends Extension {
           Main.notify(_("Wallpicker"), _("No wallpapers found."));
           return;
         }
+        // Shuffling picks one wallpaper for every screen.
+        if (settings.get_value("monitor-wallpapers").deep_unpack &&
+            Object.keys(settings.get_value("monitor-wallpapers").deep_unpack()).length)
+          settings.set_value("monitor-wallpapers", new GLib.Variant("a{ss}", {}));
         setWallpaper(
           images[Math.floor(Math.random() * images.length)],
           settings.get_string("picture-mode"),
@@ -270,7 +273,7 @@ export default class WallpickerExtension extends Extension {
 
   async _openWallpapersFolder() {
     try {
-      const settings = this._loadSettings();
+      const settings = this._extSettings;
       const dirs = settings.get_strv("wall-dirs");
       if (dirs.length === 0) dirs.push(DEFAULT_WALL_DIR);
       let folderPath = dirs[0] ?? null;
@@ -320,6 +323,52 @@ export default class WallpickerExtension extends Extension {
   }
 
   /**
+   * _setupPanelTint:
+   *
+   * Keeps the top bar text readable against the wallpaper behind it.
+   *
+   * A shell theme paints the top bar text one fixed colour, which stops being
+   * legible once something makes the bar transparent. This measures the strip
+   * of wallpaper the bar sits on and flips the text between light and dark.
+   * The signal handlers go into the same list disable() already walks.
+   */
+  _setupPanelTint() {
+    const update = () => this._updatePanelTint();
+    for (const [obj, signal] of [
+      [this._extSettings, "changed::adaptive-panel-color"],
+      [this._bgSettings, "changed::picture-uri"],
+      [this._bgSettings, "changed::picture-uri-dark"],
+      [this._ifaceSettings, "changed::color-scheme"],
+    ])
+      this._signalIds.push({ obj, id: obj.connect(signal, update) });
+
+    update();
+  }
+
+  _updatePanelTint() {
+    this._clearPanelTint();
+    if (!this._extSettings.get_boolean("adaptive-panel-color")) return;
+
+    const path = getCurrentWallpaper();
+    if (!path) return;
+
+    panelLuminanceAsync(path)
+      .then((luminance) => {
+        // The extension may have been disabled while the thumbnail loaded.
+        if (!this._extSettings) return;
+        Main.panel.add_style_class_name(
+          luminance > PANEL_LUMINANCE_PIVOT ? PANEL_DARK_TEXT : PANEL_LIGHT_TEXT,
+        );
+      })
+      .catch((e) => logError("Panel tint failed", e));
+  }
+
+  _clearPanelTint() {
+    Main.panel.remove_style_class_name(PANEL_LIGHT_TEXT);
+    Main.panel.remove_style_class_name(PANEL_DARK_TEXT);
+  }
+
+  /**
    * _setupLockScreenSync:
    *
    * Orchestrates the synchronization of the desktop wallpaper with the lock
@@ -334,10 +383,6 @@ export default class WallpickerExtension extends Extension {
    *   transitions.
    */
   _setupLockScreenSync() {
-    this._bgSettings = new Gio.Settings({
-      schema_id: "org.gnome.desktop.background",
-    });
-    this._extSettings = this._loadSettings();
     this._bgSignalId = null;
     this._origUpdateBackgroundEffects = null;
 
@@ -365,7 +410,7 @@ export default class WallpickerExtension extends Extension {
 
     // Stop GNOME from applying its default blur/dimming logic by patching
     // the prototype method responsible for background effects.
-    if (UnlockDialog?.UnlockDialog?.prototype?._updateBackgroundEffects) {
+    if (UnlockDialog.UnlockDialog.prototype._updateBackgroundEffects) {
       if (!this._origUpdateBackgroundEffects) {
         this._origUpdateBackgroundEffects =
           UnlockDialog.UnlockDialog.prototype._updateBackgroundEffects;
@@ -393,8 +438,8 @@ export default class WallpickerExtension extends Extension {
       this._origUpdateBackgroundEffects = null;
     }
 
-    if (this._bgSignalId) {
-      this._bgSettings?.disconnect(this._bgSignalId);
+    if (this._bgSignalId && this._bgSettings) {
+      this._bgSettings.disconnect(this._bgSignalId);
       this._bgSignalId = null;
     }
 
@@ -416,8 +461,10 @@ export default class WallpickerExtension extends Extension {
     const dialog = Main.screenShield?._dialog;
     if (!dialog?._backgroundGroup) return;
 
+    const dark =
+      this._ifaceSettings?.get_string("color-scheme") === "prefer-dark";
     const uri =
-      this._bgSettings?.get_string("picture-uri-dark") ||
+      this._bgSettings?.get_string(dark ? "picture-uri-dark" : "picture-uri") ||
       this._bgSettings?.get_string("picture-uri");
     if (!uri) return;
 
@@ -462,14 +509,16 @@ export default class WallpickerExtension extends Extension {
             cssSize = "auto";
             cssRepeat = "repeat";
             break;
+          case "spanned":
           case "zoom":
           default:
             cssSize = "cover";
             break;
         }
 
+        const safeUri = uri.replace(/'/g, "%27");
         bg._wallpickerBg.set_style(`
-          background-image: url('${uri}');
+          background-image: url('${safeUri}');
           background-size: ${cssSize};
           background-repeat: ${cssRepeat};
           background-position: center;

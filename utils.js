@@ -6,16 +6,28 @@ import GdkPixbuf from "gi://GdkPixbuf";
 
 const APP_NAME = "wallpicker";
 
-export const DATA_DIR = GLib.build_filenamev([
+const DATA_DIR = GLib.build_filenamev([
   GLib.get_user_data_dir(),
   APP_NAME,
 ]);
-export const STATS_FILE = GLib.build_filenamev([DATA_DIR, "stats.json"]);
-export const FAVORITES_FILE = GLib.build_filenamev([
+const STATS_FILE = GLib.build_filenamev([DATA_DIR, "stats.json"]);
+const FAVORITES_FILE = GLib.build_filenamev([
   DATA_DIR,
   "favorites.json",
 ]);
-export const THUMB_CACHE_DIR = GLib.build_filenamev([
+// Freedesktop thumbnail managing standard: $XDG_CACHE_HOME/thumbnails/<size>,
+// named by the MD5 of the file URI, directories 0700 and files 0600.
+const XDG_THUMB_ROOT = GLib.build_filenamev([
+  GLib.get_user_cache_dir(),
+  "thumbnails",
+]);
+export const THUMB_LARGE_DIR = GLib.build_filenamev([XDG_THUMB_ROOT, "large"]);
+const THUMB_NORMAL_DIR = GLib.build_filenamev([XDG_THUMB_ROOT, "normal"]);
+const THUMB_LARGE_MAX = 256;
+const THUMB_SOFTWARE = "Wallpicker";
+
+// Thumbnails written before the move to the shared cache.
+const LEGACY_THUMB_DIR = GLib.build_filenamev([
   GLib.get_user_cache_dir(),
   APP_NAME,
   "thumbnails",
@@ -25,7 +37,7 @@ export const THUMB_W = 190;
 export const THUMB_H = 103;
 export const SEARCH_DEBOUNCE_MS = 150;
 
-export const IMAGE_EXTS = [
+const IMAGE_EXTS = [
   ".jpg",
   ".jpeg",
   ".png",
@@ -57,8 +69,8 @@ export const PICTURE_MODE_REVERSE = Object.fromEntries(
 /**
  * Global state for debouncing writes and caching statistics.
  */
-let _statsCache = null;
-let _favsCache = null;
+let _statsCache = {};
+let _favsCache = new Set();
 let _saveTid = null;
 const _backgroundSources = new Set();
 
@@ -81,11 +93,7 @@ export function logDebug(msg) {
 }
 
 export function logError(msg, err) {
-  // Errors are always logged, but gated by the same flag to reduce noise
-  // or logged as critical only if needed. EGO wants gated console logs.
-  if (_getDebugEnabled()) {
-    console.error(`[${APP_NAME}] ${msg}: ${err?.message || err}`);
-  }
+  console.error(`[${APP_NAME}] ${msg}: ${err?.message || err}`);
 }
 
 function addBackgroundSource(id) {
@@ -112,8 +120,8 @@ export function resetModule() {
     GLib.Source.remove(id);
   }
   _backgroundSources.clear();
-  _statsCache = null;
-  _favsCache = null;
+  _statsCache = {};
+  _favsCache = new Set();
 }
 
 /**
@@ -127,21 +135,7 @@ async function saveFileAsync(path, contents) {
   const parent = file.get_parent();
 
   try {
-    if (parent) {
-      await new Promise((resolve) => {
-        parent.make_directory_with_parents_async(
-          GLib.PRIORITY_DEFAULT,
-          null,
-          (d, res) => {
-            try {
-              resolve(d.make_directory_with_parents_finish(res));
-            } catch (e) {
-              resolve();
-            }
-          },
-        );
-      });
-    }
+    if (parent) GLib.mkdir_with_parents(parent.get_path(), 0o755);
 
     return new Promise((resolve, reject) => {
       file.replace_contents_async(
@@ -173,24 +167,22 @@ async function saveFileAsync(path, contents) {
  * Persists changes via debounced write.
  */
 export function recordUse(path) {
-  try {
-    const stats = loadStats();
-    const fname = GLib.path_get_basename(path);
-    const entry = stats[fname] ?? {
-      count: 0,
-      last_used: 0.0,
-      res: null,
-      size: null,
-      mtime: 0,
-    };
-    entry.count += 1;
-    entry.last_used = GLib.get_real_time() / 1_000_000;
-    stats[fname] = entry;
+  const stats = loadStats();
+  const legacy = GLib.path_get_basename(path);
+  // Adopt any pre-existing basename entry, then key by full path from now on.
+  const entry = stats[path] ?? stats[legacy] ?? {
+    count: 0,
+    last_used: 0.0,
+    res: null,
+    size: null,
+    mtime: 0,
+  };
+  entry.count += 1;
+  entry.last_used = GLib.get_real_time() / 1_000_000;
+  stats[path] = entry;
+  if (stats[legacy] && legacy !== path) delete stats[legacy];
 
-    _saveStats();
-  } catch (e) {
-    logError("recordUse failed", e);
-  }
+  _saveStats();
 }
 
 function _normaliseStats(raw) {
@@ -218,7 +210,37 @@ function _normaliseStats(raw) {
 }
 
 export function loadStats() {
-  return _statsCache ?? {};
+  return _statsCache;
+}
+
+/**
+ * statsFor:
+ *
+ * Reads a stats entry for a wallpaper. Entries are keyed by absolute path;
+ * the basename lookup is a fallback for data written before that change.
+ */
+export function statsFor(stats, path) {
+  return stats[path] ?? stats[GLib.path_get_basename(path)];
+}
+
+export function isFavorite(path) {
+  return _favsCache.has(path) || _favsCache.has(GLib.path_get_basename(path));
+}
+
+/**
+ * toggleFavorite:
+ *
+ * Flips the favourite flag for a wallpaper and persists it.
+ * Returns the new state.
+ */
+export function toggleFavorite(path) {
+  const legacy = GLib.path_get_basename(path);
+  const on = isFavorite(path);
+  _favsCache.delete(path);
+  _favsCache.delete(legacy);
+  if (!on) _favsCache.add(path);
+  saveFavorites(_favsCache);
+  return !on;
 }
 
 async function _loadStatsAsync() {
@@ -233,15 +255,16 @@ async function _loadStatsAsync() {
         }
       });
     });
-    _statsCache = _normaliseStats(JSON.parse(new TextDecoder().decode(bytes)));
+    // Merge: entries recorded before the load finished must win.
+    const loaded = _normaliseStats(JSON.parse(new TextDecoder().decode(bytes)));
+    _statsCache = { ...loaded, ..._statsCache };
   } catch (e) {
-    logError("loadStatsAsync", e);
-    _statsCache = {};
+    logDebug(`loadStatsAsync: ${e.message}`);
   }
 }
 
 function _saveStats() {
-  if (!_statsCache || _saveTid) return;
+  if (_saveTid) return;
 
   _saveTid = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
     _saveTid = null;
@@ -254,24 +277,22 @@ function _saveStats() {
 }
 
 /**
- * Synchronous write of usage statistics. Used during shutdown.
- * Note: EGO-X-004 generally dislikes sync I/O, but flushStats is called
- * during disable() where async might not complete. We use replace_contents
- * which is a Gio wrapper, but we'll try to keep it minimal.
+ * Writes pending usage statistics synchronously.
+ *
+ * This blocks the calling loop, which is normally worth avoiding. It runs
+ * only from disable() and from the preferences window closing, where an
+ * asynchronous write would not finish before the process or the extension
+ * goes away and the pending counts would be lost.
  */
 export function flushStats() {
-  if (!_saveTid || !_statsCache) return;
+  if (!_saveTid) return;
   GLib.Source.remove(_saveTid);
   _saveTid = null;
 
   try {
     const file = Gio.File.new_for_path(STATS_FILE);
     const parent = file.get_parent();
-    if (parent) {
-      try {
-        parent.make_directory_with_parents(null);
-      } catch (_) {}
-    }
+    if (parent) GLib.mkdir_with_parents(parent.get_path(), 0o755);
 
     file.replace_contents(
       new TextEncoder().encode(JSON.stringify(_statsCache)),
@@ -283,10 +304,6 @@ export function flushStats() {
   } catch (e) {
     logError("flushStats error", e);
   }
-}
-
-export function loadFavorites() {
-  return _favsCache ?? new Set();
 }
 
 async function _loadFavoritesAsync() {
@@ -301,10 +318,10 @@ async function _loadFavoritesAsync() {
         }
       });
     });
-    _favsCache = new Set(JSON.parse(new TextDecoder().decode(bytes)));
+    for (const f of JSON.parse(new TextDecoder().decode(bytes)))
+      _favsCache.add(f);
   } catch (e) {
-    logError("loadFavoritesAsync", e);
-    _favsCache = new Set();
+    logDebug(`loadFavoritesAsync: ${e.message}`);
   }
 }
 
@@ -312,7 +329,7 @@ export async function initModuleAsync() {
   await Promise.all([_loadStatsAsync(), _loadFavoritesAsync()]);
 }
 
-export function saveFavorites(favSet) {
+function saveFavorites(favSet) {
   _favsCache = favSet;
   saveFileAsync(
     FAVORITES_FILE,
@@ -380,7 +397,11 @@ export function getImagesAsync(
   const allFiles = [];
   const seen = new Set();
   const visitedDirs = new Set();
-  const queue = [...wallDirs];
+  // ponytail: depth cap instead of symlink resolution. Bounds symlink loops
+  // (a/link -> a) which canonicalize_filename cannot detect. Raise if someone
+  // reports a legitimately deeper wallpaper tree.
+  const MAX_DEPTH = 8;
+  const queue = wallDirs.map((path) => ({ path, depth: 0 }));
 
   function processNextDir() {
     if (queue.length === 0) {
@@ -388,14 +409,8 @@ export function getImagesAsync(
       return;
     }
 
-    const dir = queue.shift();
-    let realDir = dir;
-
-    try {
-      realDir = GLib.canonicalize_filename(dir, null) ?? dir;
-    } catch (_) {
-      realDir = dir;
-    }
+    const { path: dir, depth } = queue.shift();
+    const realDir = GLib.canonicalize_filename(dir, null) ?? dir;
 
     if (visitedDirs.has(realDir)) {
       processNextDir();
@@ -406,7 +421,7 @@ export function getImagesAsync(
     try {
       const d = Gio.File.new_for_path(dir);
       d.enumerate_children_async(
-        "standard::name,standard::type,time::modified",
+        "standard::name,standard::type,time::modified,id::file",
         Gio.FileQueryInfoFlags.NONE,
         GLib.PRIORITY_DEFAULT,
         null,
@@ -439,15 +454,21 @@ export function getImagesAsync(
                     const fileType = info.get_file_type();
 
                     if (fileType === Gio.FileType.DIRECTORY) {
-                      queue.push(GLib.build_filenamev([dir, name]));
+                      if (depth < MAX_DEPTH) {
+                        queue.push({
+                          path: GLib.build_filenamev([dir, name]),
+                          depth: depth + 1,
+                        });
+                      }
                       continue;
                     }
 
                     if (!IMAGE_EXTS.some((e) => name.toLowerCase().endsWith(e)))
                       continue;
                     const path = GLib.build_filenamev([dir, name]);
-                    if (seen.has(path)) continue;
-                    seen.add(path);
+                    const key = info.get_attribute_string("id::file") ?? path;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
                     const mtime =
                       info.get_modification_date_time()?.to_unix() ?? 0;
                     allFiles.push({ path, name, mtime });
@@ -481,21 +502,23 @@ export function getImagesAsync(
     let filtered = allFiles;
 
     if (sortMode === "Starred") {
-      const favs = loadFavorites();
-      filtered = allFiles.filter((f) => favs.has(f.name));
+      filtered = allFiles.filter((f) => isFavorite(f.path));
       filtered.sort((a, b) => lower(a).localeCompare(lower(b)));
     } else if (sortMode === "Newest") {
       filtered.sort((a, b) => b.mtime - a.mtime);
     } else if (sortMode === "Most Used") {
       const stats = loadStats();
       filtered.sort(
-        (a, b) => (stats[b.name]?.count ?? 0) - (stats[a.name]?.count ?? 0),
+        (a, b) =>
+          (statsFor(stats, b.path)?.count ?? 0) -
+          (statsFor(stats, a.path)?.count ?? 0),
       );
     } else if (sortMode === "Recent") {
       const stats = loadStats();
       filtered.sort(
         (a, b) =>
-          (stats[b.name]?.last_used ?? 0) - (stats[a.name]?.last_used ?? 0),
+          (statsFor(stats, b.path)?.last_used ?? 0) -
+          (statsFor(stats, a.path)?.last_used ?? 0),
       );
     } else {
       filtered.sort((a, b) => lower(a).localeCompare(lower(b)));
@@ -508,85 +531,147 @@ export function getImagesAsync(
   processNextDir();
 }
 
+function closeStreamAsync(stream) {
+  return new Promise((resolve) => {
+    stream.close_async(GLib.PRIORITY_DEFAULT, null, (s, r) => {
+      try {
+        s.close_finish(r);
+      } catch (_) {}
+      resolve();
+    });
+  });
+}
+
 /**
- * Generates thumbnails asynchronously.
- * Scales images to fit THUMB_W x THUMB_H while preserving aspect ratio.
+ * Loads a pixbuf without blocking the caller's main loop.
+ * Used by the preferences grid, which renders many thumbnails per frame.
+ */
+export async function loadPixbufAsync(path) {
+  const stream = await new Promise((res, rej) => {
+    Gio.File.new_for_path(path).read_async(
+      GLib.PRIORITY_DEFAULT,
+      null,
+      (f, r) => {
+        try {
+          res(f.read_finish(r));
+        } catch (e) {
+          rej(e);
+        }
+      },
+    );
+  });
+  try {
+    return await new Promise((res, rej) => {
+      GdkPixbuf.Pixbuf.new_from_stream_async(stream, null, (s, r) => {
+        try {
+          res(GdkPixbuf.Pixbuf.new_from_stream_finish(r));
+        } catch (e) {
+          rej(e);
+        }
+      });
+    });
+  } finally {
+    await closeStreamAsync(stream);
+  }
+}
+
+/**
+ * thumbnailPathFor:
+ *
+ * Location of a file's thumbnail under the freedesktop standard: the MD5 of
+ * the file's URI, inside the requested size directory.
+ */
+export function thumbnailPathFor(imagePath, dir = THUMB_LARGE_DIR) {
+  const uri = Gio.File.new_for_path(imagePath).get_uri();
+  const hash = GLib.compute_checksum_for_string(GLib.ChecksumType.MD5, uri, -1);
+  return GLib.build_filenamev([dir, `${hash}.png`]);
+}
+
+function queryInfoAsync(file, attrs) {
+  return new Promise((resolve) => {
+    file.query_info_async(
+      attrs,
+      Gio.FileQueryInfoFlags.NONE,
+      GLib.PRIORITY_DEFAULT,
+      null,
+      (f, res) => {
+        try {
+          resolve(f.query_info_finish(res));
+        } catch (_) {
+          resolve(null);
+        }
+      },
+    );
+  });
+}
+
+const mtimeOf = (info) => info?.get_modification_date_time()?.to_unix() ?? 0;
+
+/**
+ * Produces a thumbnail for an image, preferring one the desktop already made.
+ *
+ * Reads the shared freedesktop cache first, so anything Files has already
+ * thumbnailed costs nothing. Anything missing is generated into that same
+ * cache with the standard metadata, which means Files can reuse ours too.
+ * Falls back to the original image if a thumbnail cannot be produced.
  */
 export async function getThumbnailAsync(imagePath) {
-  const hash = GLib.compute_checksum_for_string(
-    GLib.ChecksumType.MD5,
-    imagePath,
-    -1,
-  );
-  const thumbPath = GLib.build_filenamev([THUMB_CACHE_DIR, `${hash}.png`]);
-  const thumbFile = Gio.File.new_for_path(thumbPath);
   const origFile = Gio.File.new_for_path(imagePath);
+  const uri = origFile.get_uri();
+  const srcInfo = await queryInfoAsync(origFile, "time::modified");
+  const srcMtime = mtimeOf(srcInfo);
 
-  try {
-    const [tInfo, oInfo] = await Promise.all([
-      new Promise((resolve) => {
-        thumbFile.query_info_async(
-          "time::modified",
-          Gio.FileQueryInfoFlags.NONE,
-          GLib.PRIORITY_DEFAULT,
-          null,
-          (f, res) => {
-            try {
-              resolve(f.query_info_finish(res));
-            } catch (_) {
-              resolve(null);
-            }
-          },
-        );
-      }),
-      new Promise((resolve) => {
-        origFile.query_info_async(
-          "time::modified",
-          Gio.FileQueryInfoFlags.NONE,
-          GLib.PRIORITY_DEFAULT,
-          null,
-          (f, res) => {
-            try {
-              resolve(f.query_info_finish(res));
-            } catch (_) {
-              resolve(null);
-            }
-          },
-        );
-      }),
-    ]);
+  // A thumbnail is usable when it is no older than the image it depicts.
+  for (const dir of [THUMB_LARGE_DIR, THUMB_NORMAL_DIR, LEGACY_THUMB_DIR]) {
+    const candidate =
+      dir === LEGACY_THUMB_DIR
+        ? GLib.build_filenamev([
+            dir,
+            `${GLib.compute_checksum_for_string(GLib.ChecksumType.MD5, imagePath, -1)}.png`,
+          ])
+        : thumbnailPathFor(imagePath, dir);
+    const info = await queryInfoAsync(
+      Gio.File.new_for_path(candidate),
+      "time::modified",
+    );
+    if (info && mtimeOf(info) >= srcMtime) return candidate;
+  }
 
-    if (tInfo && oInfo) {
-      const tTime = tInfo.get_modification_date_time()?.to_unix() ?? 0;
-      const oTime = oInfo.get_modification_date_time()?.to_unix() ?? 0;
-      if (tTime >= oTime) return thumbPath;
-    }
-  } catch (_) {}
+  const thumbPath = thumbnailPathFor(imagePath);
+  const thumbFile = Gio.File.new_for_path(thumbPath);
 
   return new Promise((resolve) => {
     const id = addBackgroundSource(
       GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
         (async () => {
           removeBackgroundSource(id);
+          let tmpPath = null;
           try {
-            const parent = thumbFile.get_parent();
-            if (parent) {
-              await new Promise((res) => {
-                parent.make_directory_with_parents_async(
-                  GLib.PRIORITY_DEFAULT,
-                  null,
-                  (d, r) => {
-                    try {
-                      res(d.make_directory_with_parents_finish(r));
-                    } catch (e) {
-                      res();
-                    }
-                  },
-                );
+            GLib.mkdir_with_parents(THUMB_LARGE_DIR, 0o700);
+
+            // Read the header first so small images are never scaled up past
+            // their own resolution, which the standard forbids.
+            const dims = await new Promise((res) => {
+              GdkPixbuf.Pixbuf.get_file_info_async(imagePath, null, (_s, r) => {
+                try {
+                  res(GdkPixbuf.Pixbuf.get_file_info_finish(r));
+                } catch (_) {
+                  res(null);
+                }
               });
+            });
+            let targetW = THUMB_LARGE_MAX;
+            let targetH = THUMB_LARGE_MAX;
+            if (dims && dims[1] > 0 && dims[2] > 0) {
+              const ratio = Math.min(
+                1,
+                THUMB_LARGE_MAX / Math.max(dims[1], dims[2]),
+              );
+              targetW = Math.max(1, Math.round(dims[1] * ratio));
+              targetH = Math.max(1, Math.round(dims[2] * ratio));
             }
 
-            const stream = await new Promise((res, rej) => {
+            const inStream = await new Promise((res, rej) => {
               origFile.read_async(GLib.PRIORITY_DEFAULT, null, (f, r) => {
                 try {
                   res(f.read_finish(r));
@@ -596,16 +681,42 @@ export async function getThumbnailAsync(imagePath) {
               });
             });
 
-            const pixbuf = await new Promise((res, rej) => {
-              GdkPixbuf.Pixbuf.new_from_stream_at_scale_async(
-                stream,
-                THUMB_W,
-                THUMB_H,
-                true,
+            let pixbuf;
+            try {
+              pixbuf = await new Promise((res, rej) => {
+                GdkPixbuf.Pixbuf.new_from_stream_at_scale_async(
+                  inStream,
+                  targetW,
+                  targetH,
+                  true,
+                  null,
+                  (_s, r) => {
+                    try {
+                      res(GdkPixbuf.Pixbuf.new_from_stream_finish(r));
+                    } catch (e) {
+                      rej(e);
+                    }
+                  },
+                );
+              });
+            } finally {
+              await closeStreamAsync(inStream);
+            }
+
+            // Write beside the target then rename, so a reader never sees a
+            // half-written thumbnail.
+            tmpPath = `${thumbPath}.${GLib.get_monotonic_time()}.tmp`;
+            const tmpFile = Gio.File.new_for_path(tmpPath);
+            const outStream = await new Promise((res, rej) => {
+              tmpFile.replace_async(
                 null,
-                (s, r) => {
+                false,
+                Gio.FileCreateFlags.REPLACE_DESTINATION,
+                GLib.PRIORITY_DEFAULT,
+                null,
+                (f, r) => {
                   try {
-                    res(GdkPixbuf.Pixbuf.new_from_stream_finish(r));
+                    res(f.replace_finish(r));
                   } catch (e) {
                     rej(e);
                   }
@@ -613,26 +724,42 @@ export async function getThumbnailAsync(imagePath) {
               );
             });
 
-            const [success] = await new Promise((res) => {
-              pixbuf.save_to_streamv_async(
-                thumbFile.replace(null, false, Gio.FileCreateFlags.NONE, null),
-                "png",
-                null,
-                null,
-                null,
-                (p, r) => {
-                  try {
-                    res(p.save_to_stream_finish(r));
-                  } catch (e) {
-                    res([false]);
-                  }
-                },
-              );
-            });
+            let success = false;
+            try {
+              success = await new Promise((res) => {
+                pixbuf.save_to_streamv_async(
+                  outStream,
+                  "png",
+                  ["tEXt::Thumb::URI", "tEXt::Thumb::MTime", "tEXt::Software"],
+                  [uri, String(srcMtime), THUMB_SOFTWARE],
+                  null,
+                  (_p, r) => {
+                    try {
+                      res(GdkPixbuf.Pixbuf.save_to_stream_finish(r));
+                    } catch (e) {
+                      logDebug(`thumbnail save: ${e.message}`);
+                      res(false);
+                    }
+                  },
+                );
+              });
+            } finally {
+              await closeStreamAsync(outStream);
+            }
 
-            resolve(success ? thumbPath : imagePath);
+            if (!success) throw new Error("pixbuf save failed");
+            GLib.chmod(tmpPath, 0o600);
+            if (GLib.rename(tmpPath, thumbPath) !== 0)
+              throw new Error("thumbnail rename failed");
+            tmpPath = null;
+            resolve(thumbPath);
           } catch (e) {
             logDebug(`getThumbnailAsync error: ${e.message}`);
+            if (tmpPath) {
+              try {
+                Gio.File.new_for_path(tmpPath).delete(null);
+              } catch (_) {}
+            }
             resolve(imagePath);
           }
         })();
@@ -643,32 +770,49 @@ export async function getThumbnailAsync(imagePath) {
 }
 
 /**
+ * Average relative luminance of the strip of an image that sits behind the
+ * top bar, on a 0 to 1 scale.
+ *
+ * Reads the cached 256 px thumbnail rather than the full wallpaper, so this
+ * costs nothing once the thumbnail exists. The strip is taken from the top of
+ * the image, which matches the visible area for every picture-option except
+ * "centered".
+ */
+export async function panelLuminanceAsync(imagePath, topFraction = 0.1) {
+  const pixbuf = await loadPixbufAsync(await getThumbnailAsync(imagePath));
+  const pixels = pixbuf.get_pixels();
+  const stride = pixbuf.get_rowstride();
+  const channels = pixbuf.get_n_channels();
+  const width = pixbuf.get_width();
+  const rows = Math.max(1, Math.round(pixbuf.get_height() * topFraction));
+
+  let total = 0;
+  let count = 0;
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < width; x++) {
+      const o = y * stride + x * channels;
+      // sRGB relative luminance weights.
+      total +=
+        0.2126 * pixels[o] + 0.7152 * pixels[o + 1] + 0.0722 * pixels[o + 2];
+      count++;
+    }
+  }
+  return count ? total / count / 255 : 0.5;
+}
+
+/**
  * Retrieves image metadata (resolution, file size).
  * Updates and caches results in stats for subsequent performance.
  */
 export async function getImageInfo(path) {
-  const fname = GLib.path_get_basename(path);
   try {
     const stats = loadStats();
-    let entry = stats[fname];
+    let entry = statsFor(stats, path);
 
     const file = Gio.File.new_for_path(path);
-    const info = await new Promise((resolve, reject) => {
-      file.query_info_async(
-        "standard::size,time::modified",
-        Gio.FileQueryInfoFlags.NONE,
-        GLib.PRIORITY_DEFAULT,
-        null,
-        (f, res) => {
-          try {
-            resolve(f.query_info_finish(res));
-          } catch (e) {
-            reject(e);
-          }
-        },
-      );
-    });
-    const mtime = info.get_modification_date_time()?.to_unix() ?? 0;
+    const info = await queryInfoAsync(file, "standard::size,time::modified");
+    if (!info) return "Unknown";
+    const mtime = mtimeOf(info);
 
     if (entry?.res && entry?.size && entry?.mtime === mtime)
       return `${entry.res} | ${entry.size}`;
@@ -700,7 +844,7 @@ export async function getImageInfo(path) {
 
     if (resChanged) {
       if (!entry) {
-        entry = stats[fname] = { count: 0, last_used: 0 };
+        entry = stats[path] = { count: 0, last_used: 0 };
       }
       entry.res = res;
       entry.size = sizeStr;
@@ -715,121 +859,133 @@ export async function getImageInfo(path) {
   }
 }
 
-export function getCacheInfoAsync(callback) {
-  let totalSize = 0,
-    count = 0;
-  try {
-    const dir = Gio.File.new_for_path(THUMB_CACHE_DIR);
-    dir.enumerate_children_async(
-      "standard::size",
-      Gio.FileQueryInfoFlags.NONE,
-      GLib.PRIORITY_DEFAULT,
-      null,
-      (source, res) => {
-        let iter;
-        try {
-          iter = source.enumerate_children_finish(res);
-        } catch (_) {
-          callback({ totalSize, count });
-          return;
-        }
+/**
+ * Enumerates the thumbnails belonging to the user's own wallpapers.
+ *
+ * The cache is shared with the rest of the desktop, so both the size report
+ * and the clear operation are scoped to images in the configured folders.
+ * Thumbnails other applications created for other files are never touched.
+ */
+function ownThumbnailsAsync(dirs, callback) {
+  getImagesAsync(dirs, "A-Z", 0, async (paths) => {
+    const found = [];
+    for (const p of paths) {
+      const legacyHash = GLib.compute_checksum_for_string(
+        GLib.ChecksumType.MD5,
+        p,
+        -1,
+      );
+      const candidates = [
+        thumbnailPathFor(p, THUMB_LARGE_DIR),
+        thumbnailPathFor(p, THUMB_NORMAL_DIR),
+        GLib.build_filenamev([LEGACY_THUMB_DIR, `${legacyHash}.png`]),
+      ];
+      for (const c of candidates) {
+        const info = await queryInfoAsync(
+          Gio.File.new_for_path(c),
+          "standard::size",
+        );
+        if (info) found.push({ path: c, size: info.get_size() });
+      }
+    }
+    callback(found);
+  });
+}
 
-        const nextBatch = () => {
-          iter.next_files_async(50, GLib.PRIORITY_DEFAULT, null, (it, res2) => {
-            try {
-              const files = it.next_files_finish(res2);
-              if (files.length === 0) {
-                it.close(null);
-                callback({ totalSize, count });
-                return;
-              }
-              for (const info of files) {
-                totalSize += info.get_size();
-                count++;
-              }
-              const id = addBackgroundSource(
-                GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                  removeBackgroundSource(id);
-                  nextBatch();
-                  return GLib.SOURCE_REMOVE;
-                }),
-              );
-            } catch (_) {
-              callback({ totalSize, count });
-            }
-          });
-        };
-        nextBatch();
-      },
-    );
+export function getCacheInfoAsync(dirs, callback) {
+  ownThumbnailsAsync(dirs, (found) => {
+    callback({
+      totalSize: found.reduce((n, f) => n + f.size, 0),
+      count: found.length,
+    });
+  });
+}
+
+export function clearCacheAsync(dirs, callback) {
+  try {
+    ownThumbnailsAsync(dirs, async (found) => {
+      for (const f of found) {
+        await new Promise((resolve) => {
+          Gio.File.new_for_path(f.path).delete_async(
+            GLib.PRIORITY_DEFAULT,
+            null,
+            (file, res) => {
+              try {
+                file.delete_finish(res);
+              } catch (_) {}
+              resolve();
+            },
+          );
+        });
+      }
+      callback?.(true);
+    });
   } catch (e) {
-    logDebug(`getCacheInfoAsync log: ${e.message}`);
-    callback({ totalSize, count });
+    logDebug(`clearCacheAsync: ${e.message}`);
+    callback?.(false);
   }
 }
 
-export function clearCacheAsync(callback) {
-  try {
-    const dir = Gio.File.new_for_path(THUMB_CACHE_DIR);
-    dir.enumerate_children_async(
-      "standard::name",
-      Gio.FileQueryInfoFlags.NONE,
-      GLib.PRIORITY_DEFAULT,
-      null,
-      (source, res) => {
-        let iter;
-        try {
-          iter = source.enumerate_children_finish(res);
-        } catch (_) {
-          callback?.(false);
-          return;
-        }
+/**
+ * Paints one image per monitor onto a single canvas matching the desktop's
+ * full bounding box, which GNOME then stretches across all outputs in
+ * "spanned" mode. GNOME has no per-monitor wallpaper setting of its own, so
+ * composing one wide image is the only way to get different wallpapers on
+ * different screens without patching the Shell.
+ *
+ * monitors: [{ x, y, width, height, connector }]
+ * assignments: { [connector]: imagePath }
+ * Returns the path of the composed image.
+ */
+export async function composeSpannedAsync(monitors, assignments, fallback) {
+  if (!monitors.length) throw new Error("no monitors");
 
-        const nextBatch = () => {
-          iter.next_files_async(50, GLib.PRIORITY_DEFAULT, null, (it, res2) => {
-            try {
-              const files = it.next_files_finish(res2);
-              if (files.length === 0) {
-                it.close(null);
-                callback?.(true);
-                return;
-              }
+  const right = Math.max(...monitors.map((m) => m.x + m.width));
+  const bottom = Math.max(...monitors.map((m) => m.y + m.height));
+  const canvas = GdkPixbuf.Pixbuf.new(
+    GdkPixbuf.Colorspace.RGB,
+    false,
+    8,
+    right,
+    bottom,
+  );
+  canvas.fill(0x000000ff);
 
-              let pending = files.length;
-              for (const info of files) {
-                const child = dir.get_child(info.get_name());
-                child.delete_async(
-                  GLib.PRIORITY_DEFAULT,
-                  null,
-                  (_f, delRes) => {
-                    try {
-                      _f.delete_finish(delRes);
-                    } catch (_) {}
-                    if (--pending === 0) {
-                      const id = addBackgroundSource(
-                        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                          removeBackgroundSource(id);
-                          nextBatch();
-                          return GLib.SOURCE_REMOVE;
-                        }),
-                      );
-                    }
-                  },
-                );
-              }
-            } catch (e) {
-              logDebug(`clearCacheAsync log: ${e.message}`);
-              callback?.(false);
-            }
-          });
-        };
-        nextBatch();
-      },
+  for (const m of monitors) {
+    const src = assignments[m.connector] ?? fallback;
+    if (!src) continue;
+    let pb;
+    try {
+      pb = await loadPixbufAsync(src);
+    } catch (e) {
+      logDebug(`composeSpanned skip ${m.connector}: ${e.message}`);
+      continue;
+    }
+    // Cover the monitor, centred, preserving aspect ratio.
+    const scale = Math.max(m.width / pb.get_width(), m.height / pb.get_height());
+    const offsetX = m.x + (m.width - pb.get_width() * scale) / 2;
+    const offsetY = m.y + (m.height - pb.get_height() * scale) / 2;
+    pb.composite(
+      canvas,
+      m.x,
+      m.y,
+      m.width,
+      m.height,
+      offsetX,
+      offsetY,
+      scale,
+      scale,
+      GdkPixbuf.InterpType.BILINEAR,
+      255,
     );
-  } catch (e) {
-    logDebug(`clearCacheAsync log: ${e.message}`);
-    callback?.(false);
   }
+
+  GLib.mkdir_with_parents(DATA_DIR, 0o755);
+  const out = GLib.build_filenamev([DATA_DIR, "spanned.png"]);
+  const tmp = `${out}.${GLib.get_monotonic_time()}.tmp`;
+  canvas.savev(tmp, "png", [], []);
+  if (GLib.rename(tmp, out) !== 0) throw new Error("spanned rename failed");
+  return out;
 }
 
 export function makeDisplayName(fname, maxLen = 20) {

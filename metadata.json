@@ -3,8 +3,17 @@
   "description": "Pick wallpapers from the top bar",
   "uuid": "wallpicker@omarxkhalid.github.io",
   "gettext-domain": "wallpicker@omarxkhalid.github.io",
-  "shell-version": ["46", "47", "48"],
-  "version": 5,
+  "shell-version": [
+    "46",
+    "47",
+    "48"
+  ],
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ],
+  "version": 6,
+  "version-name": "6.0",
   "settings-schema": "org.gnome.shell.extensions.wallpicker",
   "url": "https://github.com/OMARxKHALID/Wallpicker"
 }

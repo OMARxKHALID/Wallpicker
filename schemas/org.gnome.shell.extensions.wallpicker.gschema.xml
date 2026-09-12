@@ -21,6 +21,16 @@
       <summary>Sync wallpaper to lock screen</summary>
       <description>Whether to automatically sync the desktop wallpaper to the lock screen.</description>
     </key>
+    <key name="adaptive-panel-color" type="b">
+      <default>false</default>
+      <summary>Adapt top bar text colour to the wallpaper</summary>
+      <description>Use light top bar text over a dark wallpaper and dark text over a light one. Only visible when something makes the top bar transparent.</description>
+    </key>
+    <key name="monitor-wallpapers" type="a{ss}">
+      <default>{}</default>
+      <summary>Per-monitor wallpapers</summary>
+      <description>Maps a monitor connector name to the wallpaper shown on it. When set, the wallpapers are composed into one spanned image.</description>
+    </key>
     <key name="debug-logging" type="b">
       <default>false</default>
       <summary>Enable debug logging</summary>

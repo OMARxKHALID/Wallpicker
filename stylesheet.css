@@ -1,0 +1,22 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Top bar text colour for the adaptive panel option.
+ *
+ * The selectors carry both the #panel id and the state class so they outweigh
+ * a shell theme's own `#panel .panel-button` rule, which is what sets the
+ * colour by default.
+ */
+
+#panel.wallpicker-panel-light .panel-button,
+#panel.wallpicker-panel-light .panel-button.clock-display,
+#panel.wallpicker-panel-light .panel-button .system-status-icon,
+#panel.wallpicker-panel-light .panel-button .app-menu-icon {
+  color: #f6f5f4;
+}
+
+#panel.wallpicker-panel-dark .panel-button,
+#panel.wallpicker-panel-dark .panel-button.clock-display,
+#panel.wallpicker-panel-dark .panel-button .system-status-icon,
+#panel.wallpicker-panel-dark .panel-button .app-menu-icon {
+  color: #241f31;
+}
